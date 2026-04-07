@@ -195,7 +195,23 @@ export class GridEngine extends EventEmitter {
   }
 
   /**
-   * Iniciar bot (cambiar de pausado a running)
+   * Iniciar bot (cambiar de pausado a running).
+   *
+   * Two paths:
+   *   1. RESUME — bot already has open orders and/or an open position on
+   *      GRVT (e.g. previously running, paused in DB without cancelling
+   *      orders, or rescued from a zombie state). We rebind to the existing
+   *      state without placing any new orders. This is the same logic
+   *      `loadActiveBots()` runs on engine startup for bots already in
+   *      'running' status.
+   *   2. FRESH START — no GRVT-side state, we bootstrap from scratch via
+   *      `placeInitialOrders()` (which calls executeInitialPurchase + the
+   *      grid layout).
+   *
+   * Pre Phase B.5.1, calling startBot on a bot with existing GRVT state
+   * would re-run executeInitialPurchase, double the position, and trip
+   * the GRVT 100-order Tier 1 cap. Bot 42 hit this during Phase A
+   * recovery. Detection now prevents that.
    */
   async startBot(botId: number): Promise<void> {
     try {
@@ -207,29 +223,92 @@ export class GridEngine extends EventEmitter {
         return;
       }
 
-      // Verificar balance antes de iniciar
-      await this.validateSufficientBalance(bot);
+      // Detect existing GRVT-side state. Either signal triggers RESUME mode.
+      const existingOrders = await grvtClient.getOpenOrders(bot.pair).catch((err) => {
+        console.warn(`⚠️ getOpenOrders failed during startBot detection: ${err.message}`);
+        return [];
+      });
+      const existingPosition = await grvtClient.getPosition(bot.pair).catch((err) => {
+        console.warn(`⚠️ getPosition failed during startBot detection: ${err.message}`);
+        return null;
+      });
+      const positionSize =
+        existingPosition && (existingPosition as any).size
+          ? Math.abs(parseFloat((existingPosition as any).size))
+          : 0;
+      const hasExistingState = existingOrders.length > 0 || positionSize > 0;
 
-      // Establecer leverage
-      await grvtClient.setLeverage(bot.pair, bot.leverage);
-
-      // Crear instancia del bot
       const instance = new GridBotInstance(bot);
       this.bots.set(botId, instance);
 
-      // Colocar órdenes iniciales
-      await instance.placeInitialOrders();
+      if (hasExistingState) {
+        console.log(
+          `🔁 Bot ${botId} RESUME — found ${existingOrders.length} open orders + position size ${positionSize}. Skipping bootstrap.`
+        );
+        await this.resumeBotInstance(bot, instance, existingOrders);
+      } else {
+        console.log(`🆕 Bot ${botId} FRESH START — no existing GRVT state, bootstrapping.`);
+        // Verificar balance antes de iniciar
+        await this.validateSufficientBalance(bot);
+        // Establecer leverage
+        await grvtClient.setLeverage(bot.pair, bot.leverage);
+        // Colocar órdenes iniciales
+        await instance.placeInitialOrders();
+      }
 
-      // Actualizar status a running
+      // Actualizar status a running (idem en ambos casos)
       await db.updateBot(botId, { status: 'running' });
 
       console.log(`🚀 Bot ${botId} iniciado - ${bot.pair} ${bot.direction} ${bot.leverage}x`);
       this.emit('botStarted', { botId });
 
     } catch (error) {
+      // Roll back the in-memory instance registration so a failed start
+      // doesn't leave a dangling instance the monitor loop will trip on.
+      this.bots.delete(botId);
       console.error(`❌ Error iniciando bot ${botId}:`, error);
       throw error;
     }
+  }
+
+  /**
+   * Rebind an existing GridBotInstance to live GRVT orders. Shared between
+   * loadActiveBots() (engine startup) and startBot() (resume path).
+   */
+  private async resumeBotInstance(
+    bot: any,
+    instance: GridBotInstance,
+    openOrders: any[]
+  ): Promise<void> {
+    // Cargar grid levels desde la DB
+    await instance.loadGridLevels();
+
+    const gridLevels = instance.getGridLevels();
+    for (const grvtOrder of openOrders) {
+      const leg = (grvtOrder as any).legs?.[0];
+      if (!leg) continue;
+
+      const price = parseFloat(leg.limit_price);
+      const side = leg.is_buying_asset ? 'buy' : 'sell';
+      const clientId = (grvtOrder as any).metadata?.client_order_id || grvtOrder.order_id;
+
+      // Match by price (closest level within $0.50)
+      const matchingLevel = gridLevels.find((l) => Math.abs(l.price - price) < 0.5);
+      if (matchingLevel) {
+        instance.setActiveOrder(String(clientId), {
+          order_id: String(clientId),
+          grid_level_id: matchingLevel.id,
+          side,
+          quantity: matchingLevel.quantity,
+          price: matchingLevel.price,
+          metadata: String(clientId),
+        } as any);
+      }
+    }
+
+    console.log(
+      `✅ Bot ${bot.id} resumed: ${instance.getActiveOrderCount()} órdenes mapeadas a grid levels`
+    );
   }
 
   /**
@@ -318,50 +397,23 @@ export class GridEngine extends EventEmitter {
    */
   private async loadActiveBots(): Promise<void> {
     const activeBots = await db.getBotsByStatus('running');
-    
+
     for (const bot of activeBots) {
       try {
         console.log(`🔧 [DEBUG] Cargando bot ${bot.id} - ${bot.pair} (status: ${bot.status})`);
-        
+
         const instance = new GridBotInstance(bot);
         this.bots.set(bot.id, instance);
-        
-        // Cargar grid levels
-        await instance.loadGridLevels();
-        
-        // Reconstruir activeOrders desde GRVT open orders + nuestra DB
+
         const openOrders = await grvtClient.getOpenOrders(bot.pair);
         console.log(`📥 Bot ${bot.id}: ${openOrders.length} órdenes abiertas en GRVT`);
-        
-        // Mapear cada orden de GRVT a un grid level por precio
-        const gridLevels = instance.getGridLevels();
-        for (const grvtOrder of openOrders) {
-          const leg = (grvtOrder as any).legs?.[0];
-          if (!leg) continue;
-          
-          const price = parseFloat(leg.limit_price);
-          const side = leg.is_buying_asset ? 'buy' : 'sell';
-          const clientId = (grvtOrder as any).metadata?.client_order_id || grvtOrder.order_id;
-          
-          // Encontrar el grid level más cercano a este precio
-          const matchingLevel = gridLevels.find(l => Math.abs(l.price - price) < 0.5);
-          
-          if (matchingLevel) {
-            instance.setActiveOrder(String(clientId), {
-              order_id: String(clientId),
-              grid_level_id: matchingLevel.id,
-              side,
-              quantity: matchingLevel.quantity,
-              price: matchingLevel.price,
-              metadata: String(clientId)
-            } as any);
-          }
-        }
-        
-        console.log(`✅ Bot ${bot.id} cargado: ${instance.getActiveOrderCount()} órdenes mapeadas a grid levels`);
-        
+
+        // Shared resume logic with startBot()'s RESUME path.
+        await this.resumeBotInstance(bot, instance, openOrders);
+
       } catch (error) {
         console.error(`❌ Error cargando bot ${bot.id}:`, error);
+        this.bots.delete(bot.id);
         await db.updateBot(bot.id, { status: 'paused' });
       }
     }

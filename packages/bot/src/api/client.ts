@@ -490,7 +490,13 @@ export class GRVTClient {
                 sub_account_id: this.tradingAccountId,
                 instrument: position.instrument,
                 funding_rate: '0', // No disponible en summary
-                funding_time: Date.now(), // Timestamp actual
+                // BUG FIX: grid-engine.ts treats funding_time as SECONDS and
+                // does `payment.funding_time * 1000` to convert to ms before
+                // building a Date. Date.now() returns ms, so the *1000 was
+                // turning ms into μs → year 058236 in the stored ISO string.
+                // 739 rows in production were corrupted by this; backfilled
+                // via SQL on deploy. New rows now correctly stamp seconds.
+                funding_time: Math.floor(Date.now() / 1000),
                 payment: Math.abs(fundingAmount).toString(), // Valor absoluto
                 position_size: position.size || '0'
               });
