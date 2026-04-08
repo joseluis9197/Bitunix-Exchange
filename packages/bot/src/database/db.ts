@@ -1088,6 +1088,28 @@ export class GridBotDB {
   }
 
   /**
+   * Fills for a specific bot, ordered chronologically. Used by the
+   * engine's calculateRealGridProfit() — must filter by bot_id so the
+   * spread-pair matcher only sees this bot's fills, not the entire
+   * sub-account history. Bot 44 hit a leak when this filter was
+   * missing on 2026-04-08 (inherited bot 42's $76 profit).
+   */
+  async getFillsForBot(botId: number): Promise<Array<{
+    is_buyer: number;
+    price: number;
+    size: number;
+    fee: number;
+    event_time: string;
+  }>> {
+    return this.dbAll(`
+      SELECT is_buyer, price, size, fee, event_time
+      FROM fills_archive
+      WHERE bot_id = ?
+      ORDER BY event_time ASC
+    `, [botId]);
+  }
+
+  /**
    * Compute realized PnL by FIFO matching every fill in fills_archive.
    *
    * Algorithm: walk fills oldest→newest, maintain a queue of open BUY lots

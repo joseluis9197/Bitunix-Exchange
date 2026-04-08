@@ -2483,42 +2483,50 @@ class GridBotInstance {
   }
 
   /**
-   * Calcular grid profit REAL desde fills de GRVT
-   * Parea buys con sells a ~gridSpacing de distancia
+   * Real grid profit for THIS bot, computed by spread-pair matching
+   * its own fills (filtered by bot_id from fills_archive).
+   *
+   * Bot 44 hit a leak on 2026-04-08: the previous implementation
+   * called grvtClient.getFillHistory(1000) which returns the entire
+   * sub-account history with NO bot attribution, then ran spread-pair
+   * over the lot. Result: bot 44 (running 6 minutes, 5 fills) inherited
+   * bot 42's full $76 of grid profit. The fills_archive table has
+   * proper bot_id attribution (added in Phase B), so we read from
+   * there instead.
+   *
+   * Spread-pair details: pair each SELL with the unmatched BUY whose
+   * price is between $3 and $20 lower (one grid spacing window).
+   * MUST match v2-router /realized-summary so the dashboard and the
+   * stored bot.grid_profit_usdt agree.
    */
   private async calculateRealGridProfit(): Promise<number | null> {
     try {
-      const fills = await grvtClient.getFillHistory(1000);
-      if (!fills || fills.length === 0) return null;
+      const fills = await db.getFillsForBot(this.bot.id);
 
-      // Sort chronologically (oldest first) for correct pairing
-      const sorted = [...fills].sort((a: any, b: any) => 
-        parseInt(a.event_time) - parseInt(b.event_time)
-      );
+      if (!fills || fills.length === 0) return 0;
 
       let totalFees = 0;
       let grossProfit = 0;
       let pairs = 0;
-      const pendingBuys: Array<{price: number, size: number}> = [];
+      const pendingBuys: Array<{ price: number; size: number }> = [];
       let totalBuys = 0;
       let totalSells = 0;
 
-      sorted.forEach((f: any) => {
-        const price = parseFloat(f.price);
-        const size = parseFloat(f.size);
-        const fee = Math.abs(parseFloat(f.fee));
-        totalFees += fee;
+      for (const f of fills) {
+        // fee is signed in fills_archive: negative = rebate earned. To
+        // compute *net* grid profit we want gross - |fees| − (−|rebates|)
+        // = gross + rebates - fees, which is gross - signedFees.
+        totalFees += f.fee;
 
         if (f.is_buyer) {
           totalBuys++;
-          pendingBuys.push({price, size});
+          pendingBuys.push({ price: f.price, size: f.size });
         } else {
           totalSells++;
-          // Find best pending buy to pair: closest price BELOW this sell, min $3 spread
           let bestIdx = -1;
           let bestSpread = Infinity;
           pendingBuys.forEach((b, i) => {
-            const spread = price - b.price;
+            const spread = f.price - b.price;
             if (spread > 3 && spread < 20 && spread < bestSpread) {
               bestIdx = i;
               bestSpread = spread;
@@ -2526,20 +2534,20 @@ class GridBotInstance {
           });
           if (bestIdx >= 0) {
             const b = pendingBuys[bestIdx]!;
-            grossProfit += (price - b.price) * size;
+            grossProfit += (f.price - b.price) * f.size;
             pairs++;
             pendingBuys.splice(bestIdx, 1);
           }
         }
-      });
+      }
 
       const netProfit = grossProfit - totalFees;
-      console.log(`📊 [DEBUG] Fills: ${fills.length}, Buys: ${totalBuys}, Sells: ${totalSells}, Fees: ${totalFees.toFixed(4)}`);
-      console.log(`📊 [DEBUG] Grid pairs: ${pairs}, Gross: $${grossProfit.toFixed(2)}, Net: $${netProfit.toFixed(2)}`);
-      
-      return netProfit;
+      console.log(`📊 [DEBUG] Bot ${this.bot.id} fills: ${fills.length}, Buys: ${totalBuys}, Sells: ${totalSells}, Fees: ${totalFees.toFixed(4)}`);
+      console.log(`📊 [DEBUG] Bot ${this.bot.id} grid pairs: ${pairs}, Gross: $${grossProfit.toFixed(2)}, Net: $${netProfit.toFixed(2)}`);
 
+      return netProfit;
     } catch (error) {
+      console.error(`❌ Error calculating real grid profit for bot ${this.bot.id}:`, error);
       return null;
     }
   }
