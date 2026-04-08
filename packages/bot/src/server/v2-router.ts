@@ -51,6 +51,12 @@ interface EngineOps {
   }): Promise<number>;
   startBot(botId: number): Promise<void>;
   pauseBot(botId: number): Promise<void>;
+  updateBotRange(botId: number, lowerPrice: number, upperPrice: number): Promise<void>;
+  previewBotRangeUpdate(
+    botId: number,
+    lowerPrice: number,
+    upperPrice: number
+  ): Promise<unknown>;
 }
 
 export interface V2RouterDeps {
@@ -531,6 +537,113 @@ export function createV2Router(deps: V2RouterDeps): Router {
     return;
   }));
 
+  // ── POST /api/v2/admin/manual-trade ───────────────────────────────
+  // Operator escape hatch for one-off position adjustments OUTSIDE the
+  // grid logic. Used when the bot's auto-purchase or compound logic
+  // got the position wrong and needs a manual correction. Body:
+  //   { botId: number, side: 'buy' | 'sell', size: number, slippagePct?: number }
+  //
+  // Safety guards:
+  //   - X-Api-Key required (router middleware)
+  //   - hard cap on size (5 ETH max — refuses larger orders)
+  //   - aggressive limit price (0.5% from mark by default), GTC
+  //   - bot must exist
+  //   - returns the GRVT order_id for verification
+  //
+  // The order is placed independently of the grid — it does NOT touch
+  // grid_levels, the engine's monitor will not interfere because it
+  // only manages levels (this is just a position adjustment).
+  router.post('/admin/manual-trade', asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as {
+      botId?: unknown;
+      side?: unknown;
+      size?: unknown;
+      slippagePct?: unknown;
+    };
+    const botId = parseInt(String(body.botId ?? ''), 10);
+    const side = String(body.side ?? '');
+    const size = parseFloat(String(body.size ?? ''));
+    const slippagePct = parseFloat(String(body.slippagePct ?? '0.5'));
+
+    if (!Number.isFinite(botId) || botId <= 0) {
+      return res.status(400).json({ error: 'invalid_body', message: 'botId required' });
+    }
+    if (side !== 'buy' && side !== 'sell') {
+      return res.status(400).json({ error: 'invalid_body', message: "side must be 'buy' or 'sell'" });
+    }
+    if (!Number.isFinite(size) || size <= 0) {
+      return res.status(400).json({ error: 'invalid_body', message: 'size must be a positive number' });
+    }
+    if (size > 5) {
+      return res.status(400).json({ error: 'safety_cap', message: 'manual-trade size cap is 5 (refused for safety)' });
+    }
+    if (!Number.isFinite(slippagePct) || slippagePct <= 0 || slippagePct > 5) {
+      return res.status(400).json({ error: 'invalid_body', message: 'slippagePct must be in (0, 5]' });
+    }
+
+    const bot = await dbGet<{ id: number; pair: string }>(db, `
+      SELECT id, pair FROM grid_bots WHERE id = ?
+    `, [botId]);
+    if (!bot) return res.status(404).json({ error: 'bot not found' });
+
+    // Aggressive limit pricing — same pattern the engine's closeBot uses
+    // (0.5% on the worse side of market, GTC, executes ~immediately).
+    const ticker = await (grvtClient as unknown as { getTicker(p: string): Promise<{ last_price: string }> }).getTicker(bot.pair);
+    const lastPrice = parseFloat(ticker.last_price);
+    if (!Number.isFinite(lastPrice) || lastPrice <= 0) {
+      return res.status(502).json({ error: 'ticker_unavailable' });
+    }
+
+    const slip = slippagePct / 100;
+    const aggressivePrice =
+      side === 'sell'
+        ? Math.floor(lastPrice * (1 - slip) * 100) / 100  // 0.5% below
+        : Math.ceil(lastPrice * (1 + slip) * 100) / 100;  // 0.5% above
+
+    const subAccountId = process.env.GRVT_TRADING_ACCOUNT_ID;
+    if (!subAccountId) {
+      return res.status(500).json({ error: 'sub_account_id_missing' });
+    }
+
+    log.warn(
+      { botId, side, size, lastPrice, aggressivePrice },
+      'admin manual-trade requested'
+    );
+
+    try {
+      const order = await (grvtClient as unknown as {
+        createOrder(p: Record<string, unknown>, allowMarket?: boolean): Promise<{ order_id: string }>;
+      }).createOrder({
+        sub_account_id: subAccountId,
+        instrument: bot.pair,
+        size: (Math.floor(size * 10000) / 10000).toString(),
+        price: aggressivePrice.toString(),
+        side,
+        type: 'limit',
+        time_in_force: 'gtc',
+        metadata: `manual_trade_admin_${Date.now()}`,
+      }, true);
+
+      log.warn({ botId, orderId: order.order_id }, 'admin manual-trade order placed');
+      res.json({
+        ok: true,
+        botId,
+        side,
+        size,
+        lastPrice,
+        aggressivePrice,
+        orderId: order.order_id,
+      });
+    } catch (err) {
+      log.error({ botId, err: (err as Error).message }, 'admin manual-trade failed');
+      res.status(500).json({
+        error: 'order_failed',
+        message: (err as Error).message,
+      });
+    }
+    return;
+  }));
+
   // ── POST /api/v2/admin/backfill-fills?botId=N ─────────────────────
   // One-shot backfill for a specific bot. Pages getFillHistory backwards
   // using end_time until either GRVT returns nothing, the loop hits
@@ -901,6 +1014,117 @@ export function createV2Router(deps: V2RouterDeps): Router {
       log.error({ botId: id, err: (err as Error).message }, 'bot pause failed');
       res.status(500).json({
         error: 'pause_failed',
+        message: (err as Error).message,
+      });
+    }
+    return;
+  }));
+
+  // ── POST /api/v2/bots/:id/range/preview ───────────────────────────
+  // Read-only dry-run of a range update. Returns the full RangeUpdatePlan
+  // (orders to cancel, levels to create, ETH to auto-buy, slippage cost,
+  // safety violations) WITHOUT executing anything. The dashboard calls
+  // this on every input change to live-update the impact preview.
+  //
+  // Safety violations (e.g. current price outside new range, deficit
+  // exceeds 2 ETH cap) are returned in the plan but the request still
+  // succeeds with HTTP 200 — the dashboard surfaces them inline so the
+  // user can correct before clicking commit.
+  router.post('/bots/:id/range/preview', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+
+    const body = (req.body ?? {}) as { lowerPrice?: unknown; upperPrice?: unknown };
+    const lowerPrice = parseFloat(String(body.lowerPrice ?? ''));
+    const upperPrice = parseFloat(String(body.upperPrice ?? ''));
+
+    if (!Number.isFinite(lowerPrice) || !Number.isFinite(upperPrice)) {
+      return res.status(400).json({
+        error: 'invalid_range',
+        message: 'lowerPrice and upperPrice must be finite numbers',
+      });
+    }
+
+    try {
+      const plan = await engineOps.previewBotRangeUpdate(id, lowerPrice, upperPrice);
+      res.json({ plan });
+    } catch (err) {
+      log.error(
+        { botId: id, lowerPrice, upperPrice, err: (err as Error).message },
+        'range preview failed'
+      );
+      res.status(500).json({
+        error: 'preview_failed',
+        message: (err as Error).message,
+      });
+    }
+    return;
+  }));
+
+  // ── POST /api/v2/bots/:id/range ───────────────────────────────────
+  // Move/expand/contract the grid range. The engine handles everything:
+  //   - validates current price is within the new range (otherwise the
+  //     grid has no anchor)
+  //   - cancels orders outside the new range
+  //   - if more SELL levels are needed than current ETH position, buys
+  //     the deficit at market BEFORE placing new sell orders (otherwise
+  //     they'd reject for insufficient asset)
+  //   - creates new grid_levels for the new range
+  //   - places limit orders for them
+  //   - updates bot.lower_price / upper_price in DB
+  //
+  // This is the operator's escape hatch when price drifts out of the
+  // current grid: instead of pausing+closing+recreating, they shift
+  // the range to wherever price went and resume earning.
+  router.post('/bots/:id/range', asyncHandler(async (req, res) => {
+    const id = parseInt(String(req.params.id ?? ''), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
+
+    const body = (req.body ?? {}) as { lowerPrice?: unknown; upperPrice?: unknown };
+    const lowerPrice = parseFloat(String(body.lowerPrice ?? ''));
+    const upperPrice = parseFloat(String(body.upperPrice ?? ''));
+
+    if (!Number.isFinite(lowerPrice) || !Number.isFinite(upperPrice)) {
+      return res.status(400).json({
+        error: 'invalid_range',
+        message: 'lowerPrice and upperPrice must be finite numbers',
+      });
+    }
+    if (lowerPrice <= 0 || upperPrice <= 0) {
+      return res.status(400).json({
+        error: 'invalid_range',
+        message: 'prices must be positive',
+      });
+    }
+    if (lowerPrice >= upperPrice) {
+      return res.status(400).json({
+        error: 'invalid_range',
+        message: 'lowerPrice must be strictly less than upperPrice',
+      });
+    }
+
+    try {
+      await engineOps.updateBotRange(id, lowerPrice, upperPrice);
+      log.info({ botId: id, lowerPrice, upperPrice }, 'bot range updated via API');
+      cache.invalidatePrefix('bots');
+      const updated = await dbGet<{
+        lower_price: number;
+        upper_price: number;
+        num_grids: number;
+      }>(db, `SELECT lower_price, upper_price, num_grids FROM grid_bots WHERE id = ?`, [id]);
+      res.json({
+        id,
+        lowerPrice: updated?.lower_price ?? lowerPrice,
+        upperPrice: updated?.upper_price ?? upperPrice,
+        numGrids: updated?.num_grids ?? 0,
+      });
+    } catch (err) {
+      log.error(
+        { botId: id, lowerPrice, upperPrice, err: (err as Error).message },
+        'bot range update failed'
+      );
+      res.status(500).json({
+        error: 'range_update_failed',
         message: (err as Error).message,
       });
     }

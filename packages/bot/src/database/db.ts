@@ -32,6 +32,11 @@ export interface GridBot {
   grid_profit_seed?: number;
   grid_profit_seed_timestamp?: string;
   total_reinvested?: number;
+  // Set at creation, immutable. Source of truth for per-level order
+  // size — read by getFixedQty(), updateBotRange(), etc. Replaces
+  // the recompute-from-investment_usdt formula that drifted under
+  // compound rebalances.
+  quantity_per_level?: number;
 }
 
 export interface GridLevel {
@@ -243,6 +248,38 @@ export class GridBotDB {
       WHERE original_investment_usdt IS NULL
     `);
 
+    // Migration: quantity_per_level — the IMMUTABLE per-grid order size,
+    // set at bot creation. Critical fix for the "qty drift" bug:
+    //
+    //   Previously, getFixedQty() recomputed qty on every call from
+    //   investment_usdt * leverage * 0.75 / num_grids / midPrice.
+    //   When compound bumped investment_usdt mid-life, the formula
+    //   produced a bigger qty for new orders → buys placed at qty=0.04
+    //   would later get matched against sells placed at qty=0.05, with
+    //   the residual 0.01 polluting the position permanently. Bot 42
+    //   accumulated months of drift this way.
+    //
+    // Fix: store the qty at bot creation and read it from here forever.
+    // The only legitimate way to change it is a deliberate "rebalance"
+    // operation that ALSO adjusts the position to match — never via a
+    // silent recompute on each monitor tick.
+    try {
+      await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN quantity_per_level REAL`);
+      console.log('✅ Columna quantity_per_level agregada a grid_bots');
+    } catch (e) { /* already exists */ }
+    // Backfill from existing grid_levels[0].quantity for legacy bots —
+    // this is the qty the bot has been using lately, so it's the
+    // pragmatic "current truth". Bot 42 will get 0.05.
+    await this.dbRun(`
+      UPDATE grid_bots
+      SET quantity_per_level = (
+        SELECT quantity FROM grid_levels
+        WHERE grid_levels.bot_id = grid_bots.id
+        LIMIT 1
+      )
+      WHERE quantity_per_level IS NULL
+    `);
+
     // Tabla: bot_cash_movements — explicit ledger for every cash flow
     // touching a bot's notional. Each row records WHY investment_usdt
     // changed: 'compound' when the engine reinvested grid profit,
@@ -423,6 +460,21 @@ export class GridBotDB {
    * Crear nuevo grid bot
    */
   async createBot(params: Omit<GridBot, 'id' | 'created_at' | 'updated_at'>): Promise<number> {
+    // Compute the canonical per-level qty ONCE, at creation, and store
+    // it immutably. Same formula as the legacy getFixedQty() but only
+    // ever evaluated here, so subsequent compounds and updateBotRange
+    // calls cannot drift it.
+    const ORDER_ALLOC = 0.75;
+    const midPrice = (params.lower_price + params.upper_price) / 2;
+    const effCap = params.investment_usdt * params.leverage * ORDER_ALLOC;
+    const computedQty = Math.max(
+      Math.ceil((effCap / params.num_grids / midPrice) * 100) / 100,
+      0.03
+    );
+    // Allow caller override (e.g. wizard preview) but default to the
+    // formula above when params.quantity_per_level is not provided.
+    const quantityPerLevel = params.quantity_per_level ?? computedQty;
+
     // Set original_investment_usdt = investment_usdt at creation. After
     // this point, investment_usdt may drift (compound, manual edits) but
     // the original is immutable so we always know the real cash deposit.
@@ -430,6 +482,7 @@ export class GridBotDB {
       params.pair, params.direction, params.leverage, params.lower_price,
       params.upper_price, params.num_grids, params.investment_usdt,
       params.investment_usdt,  // original_investment_usdt = investment_usdt
+      quantityPerLevel,        // immutable per-level qty
       params.grid_profit_usdt, params.trend_pnl_usdt, params.total_pnl_usdt,
       params.status, params.position_size, params.avg_entry_price,
       params.liquidation_price, params.params_json
@@ -437,10 +490,10 @@ export class GridBotDB {
     const sql = `
       INSERT INTO grid_bots (
         pair, direction, leverage, lower_price, upper_price, num_grids,
-        investment_usdt, original_investment_usdt,
+        investment_usdt, original_investment_usdt, quantity_per_level,
         grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
         status, position_size, avg_entry_price, liquidation_price, params_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     await this.dbRun(sql, values);
@@ -686,11 +739,74 @@ export class GridBotDB {
 
   async deleteGridLevelsOutsideRange(botId: number, lower: number, upper: number): Promise<number> {
     const result = await this.dbRun(`
-      DELETE FROM grid_levels 
+      DELETE FROM grid_levels
       WHERE bot_id = ? AND (price < ? OR price > ?)
     `, [botId, lower, upper]);
-    
+
     return result.changes || 0;
+  }
+
+  /**
+   * Atomically replace ALL grid levels for a bot. Used by the
+   * range update operation: deletes everything, inserts the fresh
+   * 0..N level set, all in a single transaction so a crash mid-flight
+   * cannot leave a partial grid in the DB.
+   *
+   * Critical for the level_index UNIQUE collision fix: by deleting
+   * all old rows BEFORE inserting new ones with reused level_index
+   * values, we never violate the UNIQUE(bot_id, level_index) constraint.
+   */
+  async replaceAllGridLevels(
+    botId: number,
+    newLevels: Array<{
+      level_index: number;
+      price: number;
+      side: 'buy' | 'sell';
+      quantity: number;
+    }>
+  ): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.db.serialize(() => {
+        this.db.run('BEGIN TRANSACTION');
+        this.db.run('DELETE FROM grid_levels WHERE bot_id = ?', [botId], (delErr) => {
+          if (delErr) {
+            this.db.run('ROLLBACK');
+            return reject(delErr);
+          }
+          let pending = newLevels.length;
+          if (pending === 0) {
+            this.db.run('COMMIT', (commitErr) => {
+              if (commitErr) reject(commitErr);
+              else resolve();
+            });
+            return;
+          }
+          let failed = false;
+          for (const level of newLevels) {
+            this.db.run(
+              `INSERT INTO grid_levels (bot_id, level_index, price, side, quantity, is_filled, order_id)
+               VALUES (?, ?, ?, ?, ?, 0, '0x00')`,
+              [botId, level.level_index, level.price, level.side, level.quantity],
+              (insErr) => {
+                if (failed) return;
+                if (insErr) {
+                  failed = true;
+                  this.db.run('ROLLBACK');
+                  return reject(insErr);
+                }
+                pending--;
+                if (pending === 0 && !failed) {
+                  this.db.run('COMMIT', (commitErr) => {
+                    if (commitErr) reject(commitErr);
+                    else resolve();
+                  });
+                }
+              }
+            );
+          }
+        });
+      });
+    });
   }
 
   // === CRUD para orders ===

@@ -30,6 +30,49 @@ export interface GridCalculation {
 }
 
 /**
+ * Result of buildRangeUpdatePlan(). Returned verbatim by both
+ * /api/v2/bots/:id/range/preview (no execution) and as the input to
+ * applyRangeUpdatePlan (commit). The dashboard renders this for the
+ * user to inspect before confirming.
+ *
+ * Every numeric field is derived from real GRVT state — no estimates.
+ */
+export interface RangeUpdatePlan {
+  botId: number;
+  currentRange: { lower: number; upper: number };
+  newRange: { lower: number; upper: number };
+  currentPrice: number;
+  currentPosition: number;
+  newSellLevels: number;
+  newBuyLevels: number;
+  newTotalLevels: number;
+  newSpacing: number;
+  canonicalQty: number;
+  ethNeeded: number;
+  ethDeficit: number;
+  ethExcess: number;
+  autoBuy: {
+    size: number;
+    estimatedPrice: number;
+    estimatedCost: number;
+    slippagePct: number;
+    estimatedSlippageUsd: number;
+  } | null;
+  ordersToCancel: number;
+  ordersToCancelSample: Array<{ order_id: string; price: number }>;
+  levelsToCreate: number;
+  newLevels: Array<{
+    level_index: number;
+    price: number;
+    side: 'buy' | 'sell';
+    quantity: number;
+  }>;
+  warnings: string[];
+  safetyViolations: string[];
+  noop: boolean;
+}
+
+/**
  * Grid Trading Engine
  * Maneja la lógica completa de grid trading con safeguards
  */
@@ -41,6 +84,16 @@ export class GridEngine extends EventEmitter {
   private compoundCheckInterval: NodeJS.Timeout | null = null;
   private fillPollingInterval: NodeJS.Timeout | null = null; // Phase B.10: Fill archive poller
   private isRunning = false;
+
+  // Per-bot mutex set: a bot id is in this set while a long-running
+  // mutation (currently: updateBotRange) is in flight. monitor() skips
+  // any bot in this set so it cannot race with the mutation, place
+  // duplicate orders, or read inconsistent grid_levels mid-transaction.
+  private bumpInProgress = new Set<number>();
+
+  isBotMutating(botId: number): boolean {
+    return this.bumpInProgress.has(botId);
+  }
 
   constructor() {
     super();
@@ -70,10 +123,32 @@ export class GridEngine extends EventEmitter {
         this.pollFundingHistory().catch(console.error);
       }, 30 * 60 * 1000); // 30 minutos
 
-      // ⚠️ NUEVO: Compound check cada hora
-      this.compoundCheckInterval = setInterval(() => {
-        this.checkCompoundRebalance().catch(err => console.error('Compound check error:', err));
-      }, 60 * 60 * 1000); // Check every hour
+      // ❌ COMPOUND REBALANCE DISABLED ❌
+      //
+      // The previous implementation had two compounding bugs that
+      // ate user funds invisibly:
+      //
+      //   1. It computed "profit" as `balance - investment_usdt`,
+      //      which conflated real grid profit with any external
+      //      margin transferred into the sub-account. Every dollar
+      //      the user moved in via funding→trading was treated as
+      //      bot profit and reinvested. Bot 42's investment_usdt
+      //      ballooned from $640 → $1085 partly from this.
+      //
+      //   2. When it bumped investment_usdt, the per-level qty also
+      //      grew (via the recompute in getFixedQty()), but the
+      //      position was never bumped to match. Bot 42 ran for
+      //      months in a sub-collateralized state until we caught
+      //      it during a range-update test.
+      //
+      // Disabled until we redesign it properly: real grid_profit_usdt
+      // as the input (not balance diff), and atomic position bump in
+      // the same operation as the investment bump.
+      //
+      // this.compoundCheckInterval = setInterval(() => {
+      //   this.checkCompoundRebalance().catch(err => console.error('Compound check error:', err));
+      // }, 60 * 60 * 1000);
+      console.log('⚠️  Compound rebalance is DISABLED (broken; pending redesign)');
 
       // ⚠️ NUEVO: Daily snapshots cada 24h (00:00 UTC)
       // Inline setup (method is on GridBotInstance, not GridEngine)
@@ -483,11 +558,20 @@ export class GridEngine extends EventEmitter {
     if (!this.isRunning) return;
 
     for (const [botId, instance] of this.bots) {
+      // Skip bots currently undergoing a long-running mutation
+      // (updateBotRange). Without this skip the monitor would race
+      // against the mutation: it would see partially-deleted levels,
+      // misinterpret them as gaps, and try to "re-place" orders the
+      // mutation is also trying to place — duplicates, fights, lost
+      // money. The mutex is released in the mutation's finally block.
+      if (this.bumpInProgress.has(botId)) {
+        continue;
+      }
       try {
         await instance.monitor();
       } catch (error) {
         console.error(`❌ Error monitoreando bot ${botId}:`, error);
-        
+
         // Si hay errores críticos, pausar el bot
         if (error instanceof Error && error.message.includes('SAFEGUARD')) {
           console.log(`🚨 SAFEGUARD activado para bot ${botId} - pausando`);
@@ -913,210 +997,379 @@ export class GridEngine extends EventEmitter {
     }
   }
 
-  async updateBotRange(botId: number, newLower: number, newUpper: number): Promise<void> {
-    try {
-      const bot = await db.getBot(botId);
-      if (!bot) {
-        throw new Error(`Bot ${botId} not found`);
-      }
+  // ───────────────────────────────────────────────────────────────────
+  // RANGE UPDATE — production-quality v2
+  //
+  // Two phases, single source of truth, fully atomic for the DB write.
+  //
+  // Phase 1 — buildRangeUpdatePlan(botId, newLower, newUpper)
+  //   Pure read-only function. Returns a `RangeUpdatePlan` describing
+  //   exactly what would change: levels to insert, orders to cancel,
+  //   ETH to auto-buy (with cost estimate and slippage), warnings,
+  //   safety violations. NO state changes, NO orders sent.
+  //   Used by both /range/preview and /range/commit (the commit
+  //   phase calls it first to compute the plan, then executes).
+  //
+  // Phase 2 — applyRangeUpdatePlan(plan)
+  //   Acquires per-bot mutex (monitor() will skip the bot during this).
+  //   Buys ETH if needed, replaces all grid_levels in a single DB
+  //   transaction (the new replaceAllGridLevels() helper handles the
+  //   level_index UNIQUE collision by deleting all old rows before
+  //   inserting fresh 0..N), cancels orders, places new orders, and
+  //   updates bot.lower_price / upper_price. Releases mutex in finally.
+  //
+  // Safety caps (hard, non-overrideable from the API layer):
+  //   MAX_AUTO_BUY_ETH        = 2.0   ETH absolute cap on market buy
+  //   MAX_RANGE_DRIFT_PCT     = 50%   |new mid - current price| cap
+  //   MIN_LOWER_DISTANCE_PCT  = 50%   newLower must be ≥ 0.5 × current
+  //   MAX_UPPER_DISTANCE_PCT  = 200%  newUpper must be ≤ 2.0 × current
+  //   AUTO_BUY_SLIPPAGE_PCT   = 0.5%  IOC limit price aggression
+  // ───────────────────────────────────────────────────────────────────
 
-      // Get current price to validate range
-      const ticker = await grvtClient.getTicker(bot.pair);
-      const currentPrice = parseFloat(ticker.last_price);
-      
-      // Validate that current price is within new range
-      if (currentPrice < newLower || currentPrice > newUpper) {
-        throw new Error(`Current price $${currentPrice} is outside new range $${newLower}-$${newUpper}`);
-      }
+  async previewBotRangeUpdate(
+    botId: number,
+    newLower: number,
+    newUpper: number
+  ): Promise<RangeUpdatePlan> {
+    return this.buildRangeUpdatePlan(botId, newLower, newUpper);
+  }
 
-      console.log(`🔄 Updating range for bot ${botId}: $${bot.lower_price}-$${bot.upper_price} → $${newLower}-$${newUpper}`);
+  async updateBotRange(
+    botId: number,
+    newLower: number,
+    newUpper: number
+  ): Promise<void> {
+    // Build the plan first — same code path as preview, so the user
+    // is committing to exactly what they saw.
+    const plan = await this.buildRangeUpdatePlan(botId, newLower, newUpper);
 
-      // ===== ETH AUTO-PURCHASE LOGIC =====
-      // Calculate how many SELL levels will be needed in the new range
-      const ethTargetGrids = bot.num_grids;
-      const ethNewSpacing = (newUpper - newLower) / ethTargetGrids;
-      
-      let sellLevelsCount = 0;
-      for (let i = 0; i <= ethTargetGrids; i++) {
-        const price = newLower + (i * ethNewSpacing);
-        if (price > currentPrice) {
-          sellLevelsCount++;
-        }
-      }
-
-      // Calculate ETH needed for sell levels (using dynamic formula)
-      const effectiveCapital = bot.investment_usdt * bot.leverage;
-      const estimatedPrice = bot.pair.includes('ETH') ? currentPrice : 42000; // Use current price for ETH
-      const orderQty = effectiveCapital / (bot.num_grids * estimatedPrice);
-      const ethNeeded = sellLevelsCount * orderQty;
-
-      console.log(`📊 ETH check: need ${ethNeeded.toFixed(4)} ETH for ${sellLevelsCount} sell levels`);
-
-      // Get current position
-      let currentPosition = 0;
-      try {
-        const position = await grvtClient.getPosition(bot.pair);
-        if (position) {
-          currentPosition = parseFloat(position.size);
-        }
-      } catch (posErr) {
-        console.log(`⚠️ Could not get position for ${bot.pair}, assuming 0: ${posErr instanceof Error ? posErr.message : posErr}`);
-      }
-
-      console.log(`📍 Current ETH position: ${currentPosition.toFixed(4)} ETH, need: ${ethNeeded.toFixed(4)} ETH`);
-
-      // Check if we need to buy more ETH
-      if (currentPosition < ethNeeded) {
-        const deficit = ethNeeded - currentPosition;
-        console.log(`💰 ETH deficit detected: ${deficit.toFixed(4)} ETH. Buying at market...`);
-
-        try {
-          // Get current ticker for aggressive pricing
-          const currentTicker = await grvtClient.getTicker(bot.pair);
-          const markPrice = parseFloat(currentTicker.last_price);
-          const buyPrice = Math.ceil(markPrice * 1.005 * 100) / 100; // +0.5% to ensure fill
-
-          const marketOrder = await grvtClient.createOrder({
-            sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
-            instrument: bot.pair,
-            size: (Math.ceil(deficit * 10000) / 10000).toString(), // Round up to 4 decimals
-            price: buyPrice.toString(),
-            side: 'buy',
-            type: 'limit',
-            time_in_force: 'ioc', // Immediate or Cancel (market taker)
-            metadata: `eth_auto_purchase_range_update_${botId}`
-          }, true); // allowMarket=true
-
-          console.log(`💰 ETH purchase order sent: ${marketOrder.order_id} for ${deficit.toFixed(4)} ETH at $${buyPrice}`);
-
-          // Wait for order execution (small delay)
-          await new Promise(r => setTimeout(r, 2000));
-
-          // Verify the purchase was successful
-          let newPosition = currentPosition;
-          try {
-            const updatedPosition = await grvtClient.getPosition(bot.pair);
-            if (updatedPosition) {
-              newPosition = parseFloat(updatedPosition.size);
-            }
-          } catch (verifyErr) {
-            console.log(`⚠️ Could not verify position after purchase: ${verifyErr instanceof Error ? verifyErr.message : verifyErr}`);
-          }
-
-          if (newPosition < ethNeeded) {
-            throw new Error(`ETH purchase failed or incomplete. Position: ${newPosition.toFixed(4)} ETH, needed: ${ethNeeded.toFixed(4)} ETH`);
-          }
-
-          console.log(`✅ ETH purchase successful! New position: ${newPosition.toFixed(4)} ETH`);
-
-        } catch (purchaseError) {
-          console.error(`❌ Failed to purchase ETH:`, purchaseError);
-          throw new Error(`Cannot update range: ETH auto-purchase failed - ${purchaseError instanceof Error ? purchaseError.message : purchaseError}`);
-        }
-      } else {
-        console.log(`✅ Sufficient ETH available (${currentPosition.toFixed(4)} >= ${ethNeeded.toFixed(4)})`);
-      }
-      // ===== END ETH AUTO-PURCHASE LOGIC =====
-
-      // Cancel and remove orders outside new range
-      const gridLevels = await db.getGridLevels(botId);
-      const levelsToRemove = gridLevels.filter(level => 
-        level.price < newLower || level.price > newUpper
+    // Hard refuse on any safety violation. The dashboard preview shows
+    // the same warnings so the user is never surprised at this point.
+    if (plan.safetyViolations.length > 0) {
+      throw new Error(
+        `Range update refused: ${plan.safetyViolations.join('; ')}`
       );
-
-      const instance = this.bots.get(botId);
-      if (instance) {
-        for (const level of levelsToRemove) {
-          // Cancel order if it exists
-          if (level.order_id && level.order_id !== '0x00' && level.order_id !== 'price_based_detection') {
-            try {
-              await grvtClient.cancelOrder(level.order_id, bot.pair);
-              console.log(`🗑️ Cancelled order ${level.order_id} @ $${level.price}`);
-            } catch (cancelErr) {
-              console.log(`⚠️ Could not cancel order ${level.order_id}: ${cancelErr instanceof Error ? cancelErr.message : cancelErr}`);
-            }
-          }
-        }
-      }
-
-      // Delete levels outside range from DB
-      const deletedCount = await db.deleteGridLevelsOutsideRange(botId, newLower, newUpper);
-      console.log(`🗑️ Deleted ${deletedCount} grid levels outside new range`);
-
-      // Calculate and create new levels for expanded range
-      const remainingLevels = gridLevels.filter(level => 
-        level.price >= newLower && level.price <= newUpper
-      );
-      
-      // Calculate new grid spacing based on desired number of grids
-      const targetGrids = bot.num_grids;
-      const newSpacing = (newUpper - newLower) / targetGrids;
-      
-      // Generate all new grid levels
-      const newGridLevels: any[] = [];
-      for (let i = 0; i <= targetGrids; i++) {
-        const price = newLower + (i * newSpacing);
-        
-        // Skip if level already exists (within $0.50)
-        const exists = remainingLevels.some(existing => 
-          Math.abs(existing.price - price) < 0.5
-        );
-        if (exists) continue;
-        
-        // Determine side based on current price
-        const side = price < currentPrice ? 'buy' : 'sell';
-        
-        // Calculate quantity per grid based on investment and leverage
-        const effectiveCapital = bot.investment_usdt * bot.leverage;
-        const estimatedPrice = bot.pair.includes('ETH') ? 2100 : 42000; // Fallback
-        const quantityPerGrid = effectiveCapital / (bot.num_grids * estimatedPrice);
-        
-        newGridLevels.push({
-          bot_id: botId,
-          level_index: i,
-          side,
-          price: Math.round(price * 100) / 100,
-          quantity: quantityPerGrid,
-          is_filled: false,
-          order_id: '0x00'
-        });
-      }
-
-      // Insert new levels into database
-      for (const levelData of newGridLevels) {
-        await db.createGridLevel(levelData);
-      }
-
-      // Place orders for new levels
-      if (instance) {
-        const newLevels = await db.getGridLevels(botId);
-        const levelsToPlace = newLevels.filter(level => 
-          level.order_id === '0x00' && !level.is_filled
-        );
-
-        for (const level of levelsToPlace) {
-          try {
-            await instance.placeGridOrder(level);
-            console.log(`✅ Placed new order: ${level.side} @ $${level.price}`);
-            await new Promise(r => setTimeout(r, 500)); // Throttle
-          } catch (placeErr) {
-            console.error(`❌ Failed to place order @ $${level.price}: ${placeErr instanceof Error ? placeErr.message : placeErr}`);
-          }
-        }
-      }
-
-      // Update bot range in database
-      await db.updateBot(botId, {
-        lower_price: newLower,
-        upper_price: newUpper
-      });
-
-      console.log(`✅ Range update completed for bot ${botId}`);
-
-    } catch (error) {
-      console.error(`❌ Error updating bot range:`, error);
-      throw error;
     }
+
+    // No-op short-circuit. The plan builder already detected this and
+    // returned `noop: true`; we just exit cleanly.
+    if (plan.noop) {
+      console.log(`⚪ Range unchanged for bot ${botId} — no-op`);
+      return;
+    }
+
+    // Acquire mutex BEFORE any state mutation. Released in finally.
+    if (this.bumpInProgress.has(botId)) {
+      throw new Error(`Bot ${botId} already has a range update in flight`);
+    }
+    this.bumpInProgress.add(botId);
+
+    try {
+      await this.applyRangeUpdatePlan(plan);
+    } finally {
+      this.bumpInProgress.delete(botId);
+    }
+  }
+
+  /**
+   * Build a RangeUpdatePlan. Pure read-only — never mutates state,
+   * never sends orders. Safe to call from a /preview endpoint.
+   *
+   * Returns the plan even if there are safety violations; the caller
+   * inspects plan.safetyViolations to decide whether to commit. The
+   * dashboard surfaces these violations to the user.
+   */
+  private async buildRangeUpdatePlan(
+    botId: number,
+    newLower: number,
+    newUpper: number
+  ): Promise<RangeUpdatePlan> {
+    const bot = await db.getBot(botId);
+    if (!bot) {
+      throw new Error(`Bot ${botId} not found`);
+    }
+
+    const ticker = await grvtClient.getTicker(bot.pair);
+    const currentPrice = parseFloat(ticker.last_price);
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+      throw new Error(`Bot ${botId}: invalid ticker price`);
+    }
+
+    // No-op detection (1 cent tolerance on each bound).
+    const noop =
+      Math.abs(newLower - bot.lower_price) < 0.01 &&
+      Math.abs(newUpper - bot.upper_price) < 0.01;
+
+    // ── SAFETY CAPS (hard, non-overrideable) ─────────────────────
+    const MAX_AUTO_BUY_ETH = 2.0;
+    const MIN_LOWER_DISTANCE_PCT = 0.5;  // newLower ≥ 0.5 × current
+    const MAX_UPPER_DISTANCE_PCT = 2.0;  // newUpper ≤ 2.0 × current
+    const AUTO_BUY_SLIPPAGE_PCT = 0.5;
+
+    const safetyViolations: string[] = [];
+
+    if (newLower <= 0 || newUpper <= 0 || newLower >= newUpper) {
+      safetyViolations.push('Invalid range: lower must be < upper, both > 0');
+    }
+    if (currentPrice < newLower || currentPrice > newUpper) {
+      safetyViolations.push(
+        `Current price $${currentPrice.toFixed(2)} is outside new range $${newLower}-$${newUpper}`
+      );
+    }
+    if (newLower < currentPrice * MIN_LOWER_DISTANCE_PCT) {
+      safetyViolations.push(
+        `Lower price too far below market: $${newLower} < ${(MIN_LOWER_DISTANCE_PCT * 100).toFixed(0)}% of $${currentPrice.toFixed(2)}`
+      );
+    }
+    if (newUpper > currentPrice * MAX_UPPER_DISTANCE_PCT) {
+      safetyViolations.push(
+        `Upper price too far above market: $${newUpper} > ${(MAX_UPPER_DISTANCE_PCT * 100).toFixed(0)}% of $${currentPrice.toFixed(2)}`
+      );
+    }
+
+    // ── CANONICAL QTY (immutable, single source of truth) ────────
+    const canonicalQty = (bot as { quantity_per_level?: number }).quantity_per_level
+      ?? 0; // 0 = unknown, will be flagged in violations
+    if (!canonicalQty || canonicalQty <= 0) {
+      safetyViolations.push('Bot has no quantity_per_level set (legacy bot, run migration)');
+    }
+
+    // ── PLAN COMPUTATION ──────────────────────────────────────────
+    const numGrids = bot.num_grids;
+    const newSpacing = (newUpper - newLower) / numGrids;
+
+    // Build the full new level set (level_index 0..numGrids).
+    const newLevels: Array<{
+      level_index: number;
+      price: number;
+      side: 'buy' | 'sell';
+      quantity: number;
+    }> = [];
+    let sellLevelsCount = 0;
+    for (let i = 0; i <= numGrids; i++) {
+      const price = Math.round((newLower + i * newSpacing) * 100) / 100;
+      const side: 'buy' | 'sell' = price < currentPrice ? 'buy' : 'sell';
+      newLevels.push({ level_index: i, price, side, quantity: canonicalQty });
+      if (side === 'sell') sellLevelsCount++;
+    }
+
+    // ETH backing required for the sell side. In long-only perpetual
+    // grids, the position size should equal (number of pending sells)
+    // × (qty per sell). If short on backing, we must market-buy the
+    // deficit BEFORE the sells go in or they'd take us short.
+    const ethNeeded = sellLevelsCount * canonicalQty;
+
+    // Live position from GRVT.
+    let currentPosition = 0;
+    try {
+      const position = await grvtClient.getPosition(bot.pair);
+      if (position) currentPosition = parseFloat(position.size);
+    } catch (posErr) {
+      safetyViolations.push(
+        `Cannot read live position from GRVT: ${(posErr as Error).message}`
+      );
+    }
+
+    const ethDeficit = Math.max(0, ethNeeded - currentPosition);
+    const ethExcess = Math.max(0, currentPosition - ethNeeded);
+
+    if (ethDeficit > MAX_AUTO_BUY_ETH) {
+      safetyViolations.push(
+        `Auto-buy deficit ${ethDeficit.toFixed(4)} ETH exceeds safety cap of ${MAX_AUTO_BUY_ETH} ETH`
+      );
+    }
+
+    const autoBuyAggressivePrice =
+      Math.ceil(currentPrice * (1 + AUTO_BUY_SLIPPAGE_PCT / 100) * 100) / 100;
+    const autoBuyEstimatedCost = ethDeficit * autoBuyAggressivePrice;
+    const autoBuySlippageCostUsd = ethDeficit * currentPrice * (AUTO_BUY_SLIPPAGE_PCT / 100);
+
+    // List existing levels that would be cancelled (any with a real
+    // order_id, since we replaceAllGridLevels and re-place from scratch).
+    const existingLevels = await db.getGridLevels(botId);
+    const ordersToCancel = existingLevels
+      .filter((l) =>
+        l.order_id && l.order_id !== '0x00' && l.order_id !== 'price_based_detection'
+      )
+      .map((l) => ({ order_id: l.order_id!, price: l.price }));
+
+    const warnings: string[] = [];
+    if (noop) warnings.push('Range unchanged — this is a no-op');
+    if (ethDeficit > 0) {
+      warnings.push(
+        `Will market-buy ${ethDeficit.toFixed(4)} ETH at ~$${autoBuyAggressivePrice} (~$${autoBuyEstimatedCost.toFixed(2)} total, ~$${autoBuySlippageCostUsd.toFixed(2)} slippage)`
+      );
+    }
+    if (ethExcess > 0) {
+      warnings.push(
+        `Position has ${ethExcess.toFixed(4)} ETH excess vs the new sell-side requirement; the grid will absorb it naturally as sells fill`
+      );
+    }
+
+    return {
+      botId,
+      currentRange: { lower: bot.lower_price, upper: bot.upper_price },
+      newRange: { lower: newLower, upper: newUpper },
+      currentPrice,
+      currentPosition,
+      newSellLevels: sellLevelsCount,
+      newBuyLevels: newLevels.length - sellLevelsCount,
+      newTotalLevels: newLevels.length,
+      newSpacing,
+      canonicalQty,
+      ethNeeded,
+      ethDeficit,
+      ethExcess,
+      autoBuy:
+        ethDeficit > 0
+          ? {
+              size: ethDeficit,
+              estimatedPrice: autoBuyAggressivePrice,
+              estimatedCost: autoBuyEstimatedCost,
+              slippagePct: AUTO_BUY_SLIPPAGE_PCT,
+              estimatedSlippageUsd: autoBuySlippageCostUsd,
+            }
+          : null,
+      ordersToCancel: ordersToCancel.length,
+      ordersToCancelSample: ordersToCancel.slice(0, 5),
+      levelsToCreate: newLevels.length,
+      newLevels,
+      warnings,
+      safetyViolations,
+      noop,
+    };
+  }
+
+  /**
+   * Execute a previously-built RangeUpdatePlan. The mutex is held by
+   * the caller (updateBotRange). Steps:
+   *
+   *   1. If ethDeficit > 0: market-buy the deficit (IOC, fail loud).
+   *      Verify position increased before touching DB.
+   *   2. Cancel old GRVT orders (best-effort; failures are logged but
+   *      not fatal — the monitor's duplicate killer cleans residuals).
+   *   3. Atomically replace all grid_levels via the transactional
+   *      replaceAllGridLevels() helper. This is the step that fixes
+   *      the level_index UNIQUE collision: it deletes the entire old
+   *      set inside the transaction BEFORE inserting fresh 0..N.
+   *   4. Update bot.lower_price / upper_price.
+   *   5. Place new orders one at a time, throttled. Failures here are
+   *      logged; the monitor will pick them up next tick.
+   */
+  private async applyRangeUpdatePlan(plan: RangeUpdatePlan): Promise<void> {
+    const bot = await db.getBot(plan.botId);
+    if (!bot) throw new Error(`Bot ${plan.botId} not found at apply time`);
+
+    console.log(
+      `🔄 Updating range for bot ${plan.botId}: $${plan.currentRange.lower}-$${plan.currentRange.upper} → $${plan.newRange.lower}-$${plan.newRange.upper}`
+    );
+    console.log(
+      `📊 Plan: ${plan.newTotalLevels} levels (${plan.newBuyLevels} buys, ${plan.newSellLevels} sells), need ${plan.ethNeeded.toFixed(4)} ETH, position ${plan.currentPosition.toFixed(4)} ETH, deficit ${plan.ethDeficit.toFixed(4)} ETH`
+    );
+
+    // Step 1: ETH auto-purchase
+    if (plan.autoBuy) {
+      const sub = process.env.GRVT_TRADING_ACCOUNT_ID;
+      if (!sub) throw new Error('GRVT_TRADING_ACCOUNT_ID env var missing');
+
+      console.log(
+        `💰 Market-buying ${plan.autoBuy.size.toFixed(4)} ETH at ~$${plan.autoBuy.estimatedPrice} (deficit fill)`
+      );
+
+      const buyOrder = await grvtClient.createOrder(
+        {
+          sub_account_id: sub,
+          instrument: bot.pair,
+          size: (Math.ceil(plan.autoBuy.size * 10000) / 10000).toString(),
+          price: plan.autoBuy.estimatedPrice.toString(),
+          side: 'buy',
+          type: 'limit',
+          time_in_force: 'ioc',
+          metadata: `range_update_autobuy_${plan.botId}_${Date.now()}`,
+        },
+        true
+      );
+      console.log(`💰 Auto-buy order id ${buyOrder.order_id} sent`);
+
+      // Wait for fill, verify, fail loud if short.
+      await new Promise((r) => setTimeout(r, 2000));
+      let postPosition = plan.currentPosition;
+      try {
+        const updatedPos = await grvtClient.getPosition(bot.pair);
+        if (updatedPos) postPosition = parseFloat(updatedPos.size);
+      } catch (e) {
+        console.log(
+          `⚠️ Could not verify position after auto-buy: ${(e as Error).message}`
+        );
+      }
+      if (postPosition < plan.ethNeeded - 0.001) {
+        throw new Error(
+          `Auto-buy fill incomplete: position ${postPosition.toFixed(4)} ETH < needed ${plan.ethNeeded.toFixed(4)} ETH. Aborting before DB write.`
+        );
+      }
+      console.log(
+        `✅ Auto-buy filled. Position now ${postPosition.toFixed(4)} ETH`
+      );
+    }
+
+    // Step 2: Cancel old GRVT orders (best-effort).
+    for (const orderRef of plan.ordersToCancelSample.length === plan.ordersToCancel
+      ? plan.ordersToCancelSample
+      : (await db.getGridLevels(plan.botId))
+          .filter(
+            (l) =>
+              l.order_id &&
+              l.order_id !== '0x00' &&
+              l.order_id !== 'price_based_detection'
+          )
+          .map((l) => ({ order_id: l.order_id!, price: l.price }))) {
+      try {
+        await grvtClient.cancelOrder(orderRef.order_id, bot.pair);
+        console.log(`🗑️ Cancelled order ${orderRef.order_id} @ $${orderRef.price}`);
+      } catch (cancelErr) {
+        console.log(
+          `⚠️ Could not cancel order ${orderRef.order_id}: ${(cancelErr as Error).message}`
+        );
+      }
+    }
+
+    // Step 3: Atomic DB replacement of all grid_levels.
+    await db.replaceAllGridLevels(plan.botId, plan.newLevels);
+    console.log(
+      `🔁 Replaced grid_levels: ${plan.newLevels.length} fresh rows committed`
+    );
+
+    // Step 4: Update bot range.
+    await db.updateBot(plan.botId, {
+      lower_price: plan.newRange.lower,
+      upper_price: plan.newRange.upper,
+    });
+
+    // Step 5: Place new orders, throttled.
+    const instance = this.bots.get(plan.botId);
+    if (instance) {
+      // Refresh the bot instance's in-memory state from DB so it sees
+      // the new levels. The monitor() loop won't run for this bot until
+      // the mutex is released, so this is safe.
+      const freshBot = await db.getBot(plan.botId);
+      if (freshBot) instance.refreshBot(freshBot);
+      await instance.loadGridLevels();
+
+      const newLevelsFromDb = await db.getGridLevels(plan.botId);
+      for (const level of newLevelsFromDb) {
+        try {
+          await instance.placeGridOrder(level);
+          console.log(`✅ Placed: ${level.side} @ $${level.price}`);
+          await new Promise((r) => setTimeout(r, 500)); // throttle
+        } catch (placeErr) {
+          console.error(
+            `❌ Failed to place order @ $${level.price}: ${(placeErr as Error).message}`
+          );
+        }
+      }
+    }
+
+    console.log(`✅ Range update completed for bot ${plan.botId}`);
   }
 
   /**
@@ -1233,6 +1486,13 @@ class GridBotInstance {
     return this.bot.id;
   }
 
+  /** Replace the in-memory bot snapshot. Used by updateBotRange after
+   *  it commits a new range to the DB so the instance sees fresh
+   *  lower_price / upper_price / quantity_per_level immediately. */
+  refreshBot(bot: GridBot): void {
+    this.bot = bot;
+  }
+
   async loadGridLevels(): Promise<void> {
     this.gridLevels = await db.getGridLevels(this.bot.id);
     console.log(`📊 Bot ${this.bot.id}: ${this.gridLevels.length} grid levels cargados`);
@@ -1243,10 +1503,29 @@ class GridBotInstance {
   }
 
   /**
-   * Calculate FIXED qty per grid level using midpoint price.
-   * Same qty for ALL levels — ensures clean round-trips (buy qty = sell qty).
+   * Per-level order qty. Reads from the immutable bot.quantity_per_level
+   * column set at bot creation. The legacy version recomputed this from
+   * (investment_usdt * leverage * 0.75 / num_grids / midPrice) on every
+   * call, which DRIFTED whenever compound bumped investment_usdt mid-life:
+   * a buy placed at qty=0.04 would later get matched against a sell at
+   * qty=0.05, leaving the residual 0.01 polluting the position permanently.
+   * Bot 42 accumulated months of drift this way before we caught it.
+   *
+   * Now there is exactly one source of truth: the bot row. The only
+   * legitimate way to change qty is a deliberate "rebalance" operation
+   * that ALSO adjusts the position to match — never via a silent
+   * recompute on each monitor tick.
+   *
+   * Fallback: if quantity_per_level is null (legacy bot pre-migration),
+   * fall back to the old formula so the bot keeps running. The DB
+   * migration backfills NULL rows from grid_levels[0].quantity, so this
+   * fallback should never fire in practice.
    */
   getFixedQty(): number {
+    const stored = (this.bot as { quantity_per_level?: number }).quantity_per_level;
+    if (stored && stored > 0) return stored;
+
+    // Legacy fallback (should not be reached after migration backfill).
     const ORDER_ALLOC = 0.75;
     const effCap = (this.bot.investment_usdt || 670) * (this.bot.leverage || 10) * ORDER_ALLOC;
     const levels = this.gridLevels;
