@@ -1500,6 +1500,24 @@ export class GridBotDB {
   }
 
   /**
+   * Sum roundtrip profit for a specific bot. paired_roundtrips doesn't
+   * have bot_id, but when user_id is set (multi-tenant) we use that.
+   * For the legacy single-bot case (no user_id), returns the global sum.
+   */
+  async getRoundtripProfitSum(botId: number): Promise<number | null> {
+    const bot = await this.getBot(botId);
+    if (!bot) return null;
+    // If we have user_id, scope by it. Otherwise global sum.
+    const row = bot.user_id
+      ? await this.dbGet(
+          `SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips WHERE COALESCE(user_id, 1) = ?`,
+          [bot.user_id]
+        )
+      : await this.dbGet(`SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips`);
+    return row?.p ?? null;
+  }
+
+  /**
    * Escape hatch: return the raw sqlite3.Database handle.
    * Used by the v2 server (ws-dispatcher, v2-router) which need direct
    * `db.all` / `db.get` access for parameterized queries that don't fit

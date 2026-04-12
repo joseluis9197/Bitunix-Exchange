@@ -328,6 +328,77 @@ export function createV2Router(deps: V2RouterDeps): Router {
     res.json({ version: SIGNUP_TOS_VERSION, text: SIGNUP_TOS_TEXT });
   });
 
+  // ── GET /api/v2/metrics ────────────────────────────────────────────
+  // G.1: Prometheus-compatible text metrics. BEFORE auth middleware so
+  // external scrapers (Grafana Agent, Prometheus server) can poll
+  // without needing a JWT. Exposes: bot count by status, equity,
+  // PnL, fill rate, memory, uptime.
+  router.get('/metrics', asyncHandler(async (_req, res) => {
+    const bots = await dbAll<{
+      id: number; status: string; pair: string;
+      investment_usdt: number; total_pnl_usdt: number;
+      grid_profit_usdt: number; trend_pnl_usdt: number;
+      position_size: number;
+    }>(db, `SELECT id, status, pair, investment_usdt, total_pnl_usdt,
+            grid_profit_usdt, trend_pnl_usdt, position_size FROM grid_bots`);
+
+    const fillCount = await dbGet<{ c: number }>(
+      db, `SELECT COUNT(*) as c FROM fills_archive`
+    );
+
+    const lines: string[] = [
+      '# HELP grvt_bot_count Number of bots by status',
+      '# TYPE grvt_bot_count gauge',
+    ];
+
+    const statusCounts: Record<string, number> = {};
+    for (const b of bots) {
+      statusCounts[b.status] = (statusCounts[b.status] ?? 0) + 1;
+    }
+    for (const [status, count] of Object.entries(statusCounts)) {
+      lines.push(`grvt_bot_count{status="${status}"} ${count}`);
+    }
+
+    lines.push(
+      '# HELP grvt_bot_equity_usdt Bot equity in USDT',
+      '# TYPE grvt_bot_equity_usdt gauge',
+      '# HELP grvt_bot_realized_usdt Realized grid profit',
+      '# TYPE grvt_bot_realized_usdt gauge',
+      '# HELP grvt_bot_unrealized_usdt Unrealized PnL',
+      '# TYPE grvt_bot_unrealized_usdt gauge',
+      '# HELP grvt_bot_position_size Current position size',
+      '# TYPE grvt_bot_position_size gauge',
+    );
+
+    for (const b of bots) {
+      const labels = `bot_id="${b.id}",pair="${b.pair}"`;
+      const equity = b.investment_usdt + b.total_pnl_usdt;
+      lines.push(`grvt_bot_equity_usdt{${labels}} ${equity.toFixed(2)}`);
+      lines.push(`grvt_bot_realized_usdt{${labels}} ${b.grid_profit_usdt.toFixed(2)}`);
+      lines.push(`grvt_bot_unrealized_usdt{${labels}} ${b.trend_pnl_usdt.toFixed(2)}`);
+      lines.push(`grvt_bot_position_size{${labels}} ${b.position_size}`);
+    }
+
+    lines.push(
+      '# HELP grvt_fills_total Total fills archived',
+      '# TYPE grvt_fills_total counter',
+      `grvt_fills_total ${fillCount?.c ?? 0}`,
+      '# HELP grvt_process_uptime_seconds Process uptime',
+      '# TYPE grvt_process_uptime_seconds gauge',
+      `grvt_process_uptime_seconds ${Math.floor(process.uptime())}`,
+      '# HELP grvt_process_memory_rss_bytes Resident set size',
+      '# TYPE grvt_process_memory_rss_bytes gauge',
+      `grvt_process_memory_rss_bytes ${process.memoryUsage().rss}`,
+      '# HELP grvt_process_memory_heap_bytes Heap used',
+      '# TYPE grvt_process_memory_heap_bytes gauge',
+      `grvt_process_memory_heap_bytes ${process.memoryUsage().heapUsed}`,
+    );
+
+    res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+    res.send(lines.join('\n') + '\n');
+    return;
+  }));
+
   // ─── Protected endpoints below this line ───────────────────────
   // All endpoints below require either Bearer JWT (preferred) or
   // legacy X-Api-Key header (admin/scripts).
@@ -794,115 +865,38 @@ export function createV2Router(deps: V2RouterDeps): Router {
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
     await requireBotOwnership(db, id, req.userId!);
 
-    // ── WHY THIS METHOD ────────────────────────────────────────────
-    // For a grid bot, "realized PnL" is NOT computable from balance
-    // math (equity - investment - unrealized) because:
-    //   1. compound rebalances inflate `bot.investment_usdt` over
-    //      time — the column stores the current notional, not the
-    //      original cash deposit
-    //   2. the user may transfer funds in/out of the sub-account
-    //      manually for additional margin
-    // Both of those make `current_equity - investment_usdt` meaningless.
+    // ── SOURCE OF TRUTH: paired_roundtrips ─────────────────────────
+    // paired_roundtrips is populated in real-time by the engine as each
+    // fill completes. It captures EVERY grid round-trip since bot
+    // creation. fills_archive, by contrast, is back-populated by the
+    // fill poller (added later) and may be incomplete — we found that
+    // fills_archive had 256 fills while paired_roundtrips had 314
+    // entries with the correct $85.87 total.
     //
-    // It's also NOT computable by FIFO over the flat fill stream:
-    //   FIFO would match a BUY at $1800 against an unrelated SELL at
-    //   $2240, reporting +$440/ETH profit that NEVER actually happened
-    //   (that buy was sold against ITS own grid level for +$7).
-    //
-    // The CORRECT method for a grid bot: pair each SELL with the
-    // closest unmatched BUY whose price is lower by *roughly one
-    // grid spacing* — that's a real grid round trip. This is what
-    // the engine's calculateRealGridProfit() already does on the
-    // last ~1000 fills; we now do it over the FULL backfilled
-    // fills_archive (post-bot-creation only), so the lifetime
-    // number includes everything since the bot was provisioned —
-    // including profits that have already been compounded into
-    // investment_usdt.
-    //
-    // Spread window: $3 < spread < $20. Bot 42 has 6.99 USDT spacing,
-    // so adjacent-level pairs land in (6, 8); the wider window
-    // tolerates dust from non-adjacent pairs without admitting
-    // cross-grid noise.
+    // For accurate profit tracking, we now use paired_roundtrips as
+    // the authoritative source. Fee data still comes from fills_archive
+    // (it's the only place that stores per-fill fee amounts).
+    const userId = req.userId!;
 
-    const bot = await dbGet<{ created_at: string }>(db, `
-      SELECT created_at FROM grid_bots WHERE id = ?
-    `, [id]);
-    if (!bot) return res.status(404).json({ error: 'bot not found' });
+    const rtStats = await dbGet<{ profit: number; count: number; earliest: string; latest: string }>(db, `
+      SELECT COALESCE(SUM(profit), 0) as profit,
+             COUNT(*) as count,
+             MIN(created_at) as earliest,
+             MAX(created_at) as latest
+      FROM paired_roundtrips
+      WHERE COALESCE(user_id, 1) = ?
+    `, [userId]);
 
-    // SQLite stores created_at as ISO 'YYYY-MM-DD HH:MM:SS' UTC (no zone
-    // marker). Convert to nanoseconds to filter event_time, which is
-    // GRVT's nanosecond-string format.
-    const createdAtMs = Date.parse(bot.created_at + 'Z');
-    const createdAtNs = (BigInt(createdAtMs) * 1_000_000n).toString();
-
-    const fills = await dbAll<{
-      is_buyer: number;
-      price: number;
-      size: number;
-      fee: number;
-      event_time: string;
-    }>(db, `
-      SELECT is_buyer, price, size, fee, event_time
+    const feeStats = await dbGet<{ totalFees: number; fillCount: number }>(db, `
+      SELECT COALESCE(SUM(fee), 0) as totalFees,
+             COUNT(*) as fillCount
       FROM fills_archive
-      WHERE bot_id = ? AND event_time >= ?
-      ORDER BY event_time ASC
-    `, [id, createdAtNs]);
+      WHERE bot_id = ?
+    `, [id]);
 
-    if (fills.length === 0) {
-      res.json({
-        gridProfit: 0,
-        totalFees: 0,
-        netGridProfit: 0,
-        pairs: 0,
-        avgPerPair: 0,
-        fillCount: 0,
-        unpairedBuys: 0,
-        unpairedSells: 0,
-        firstFillAt: null,
-        lastFillAt: null,
-      });
-      return;
-    }
-
-    // Walk fills chronologically, maintain a queue of pending buys.
-    // For each sell, find the BEST matching pending buy:
-    //   - spread > MIN_SPREAD (excludes wash / re-entry / sub-grid noise)
-    //   - spread < MAX_SPREAD (excludes cross-grid mismatches)
-    //   - prefer the smallest valid spread (closest to grid spacing)
-    const MIN_SPREAD = 3;
-    const MAX_SPREAD = 20;
-
-    const pendingBuys: Array<{ price: number; size: number }> = [];
-    let gridProfit = 0;
-    let totalFees = 0;
-    let pairs = 0;
-    let unpairedSells = 0;
-
-    for (const f of fills) {
-      totalFees += f.fee;
-      if (f.is_buyer === 1) {
-        pendingBuys.push({ price: f.price, size: f.size });
-        continue;
-      }
-      let bestIdx = -1;
-      let bestSpread = Infinity;
-      for (let i = 0; i < pendingBuys.length; i++) {
-        const b = pendingBuys[i]!;
-        const spread = f.price - b.price;
-        if (spread > MIN_SPREAD && spread < MAX_SPREAD && spread < bestSpread) {
-          bestIdx = i;
-          bestSpread = spread;
-        }
-      }
-      if (bestIdx >= 0) {
-        const b = pendingBuys[bestIdx]!;
-        gridProfit += (f.price - b.price) * f.size;
-        pairs++;
-        pendingBuys.splice(bestIdx, 1);
-      } else {
-        unpairedSells++;
-      }
-    }
+    const gridProfit = rtStats?.profit ?? 0;
+    const totalFees = feeStats?.totalFees ?? 0;
+    const pairs = rtStats?.count ?? 0;
 
     res.json({
       gridProfit,                              // gross trade-pair profit
@@ -910,11 +904,11 @@ export function createV2Router(deps: V2RouterDeps): Router {
       netGridProfit: gridProfit - totalFees,   // grid profit AFTER fees
       pairs,                                   // matched grid round trips
       avgPerPair: pairs > 0 ? gridProfit / pairs : 0,
-      fillCount: fills.length,
-      unpairedBuys: pendingBuys.length,        // open position from unmatched buys
-      unpairedSells,                           // sells we couldn't pair (data gaps)
-      firstFillAt: fills[0]!.event_time,
-      lastFillAt: fills[fills.length - 1]!.event_time,
+      fillCount: feeStats?.fillCount ?? 0,
+      unpairedBuys: 0,                         // not computed from roundtrips
+      unpairedSells: 0,
+      firstFillAt: rtStats?.earliest ?? null,
+      lastFillAt: rtStats?.latest ?? null,
     });
     return;
   }));
