@@ -1459,6 +1459,31 @@ export function createV2Router(deps: V2RouterDeps): Router {
         );
       }
 
+      // H.3: stop-loss / take-profit (optional per-bot)
+      const slPct = Number((req.body as any)?.sl_pct);
+      const tpPct = Number((req.body as any)?.tp_pct);
+      const slTpUpdates: string[] = [];
+      const slTpParams: unknown[] = [];
+      if (Number.isFinite(slPct) && slPct > 0 && slPct <= 100) {
+        slTpUpdates.push('sl_pct = ?');
+        slTpParams.push(slPct);
+      }
+      if (Number.isFinite(tpPct) && tpPct > 0 && tpPct <= 1000) {
+        slTpUpdates.push('tp_pct = ?');
+        slTpParams.push(tpPct);
+      }
+      // H.2: auto-shift
+      const autoShift = (req.body as any)?.auto_shift_enabled === true;
+      const autoShiftPct = Number((req.body as any)?.auto_shift_pct);
+      if (autoShift && Number.isFinite(autoShiftPct) && autoShiftPct > 0) {
+        slTpUpdates.push('auto_shift_enabled = 1', 'auto_shift_pct = ?');
+        slTpParams.push(autoShiftPct);
+      }
+      if (slTpUpdates.length > 0) {
+        slTpParams.push(botId);
+        await dbRun(db, `UPDATE grid_bots SET ${slTpUpdates.join(', ')} WHERE id = ?`, slTpParams);
+      }
+
       cache.invalidatePrefix('bots');
       res.status(201).json({ id: botId, status: 'paused' });
     } catch (err) {
@@ -1697,6 +1722,112 @@ export function createV2Router(deps: V2RouterDeps): Router {
         message: (err as Error).message,
       });
     }
+    return;
+  }));
+
+  // ── POST /api/v2/backtest ──────────────────────────────────────────
+  // H.6: simulate a grid bot on historical candles. Pure computation —
+  // no real orders, no DB writes. Returns profit, drawdown, roundtrips,
+  // and an equity curve for charting.
+  router.post('/backtest', asyncHandler(async (req, res) => {
+    const { pair, direction, leverage, lower_price, upper_price, num_grids,
+            investment_usdt, interval, limit: candleLimit } = (req.body ?? {}) as any;
+
+    const errors: string[] = [];
+    if (!pair) errors.push('pair is required');
+    if (!Number.isFinite(lower_price) || lower_price <= 0) errors.push('lower_price > 0');
+    if (!Number.isFinite(upper_price) || upper_price <= 0) errors.push('upper_price > 0');
+    if (lower_price >= upper_price) errors.push('lower < upper');
+    if (!Number.isInteger(num_grids) || num_grids < 2) errors.push('num_grids >= 2');
+    if (!Number.isFinite(investment_usdt) || investment_usdt <= 0) errors.push('investment > 0');
+    if (!Number.isFinite(leverage) || leverage < 1) errors.push('leverage >= 1');
+    if (errors.length) return res.status(400).json({ error: 'validation_failed', errors });
+
+    try {
+      // Fetch historical candles
+      const klines = await grvtClient.getKlines(
+        pair,
+        interval || 'CI_1_H',
+        Math.min(candleLimit || 500, 1000)
+      );
+
+      const candles = klines.map((k: any) => ({
+        time: k.openTime / 1000,
+        open: k.open,
+        high: k.high,
+        low: k.low,
+        close: k.close,
+      })).reverse(); // oldest first
+
+      const { runBacktest } = await import('../bot/backtester.js');
+      const result = runBacktest(
+        { pair, direction: direction || 'long', leverage, lowerPrice: lower_price,
+          upperPrice: upper_price, numGrids: num_grids, investmentUSDT: investment_usdt },
+        candles
+      );
+
+      // Thin equity curve for response (max 200 points)
+      const step = Math.max(1, Math.floor(result.equityCurve.length / 200));
+      const thinCurve = result.equityCurve.filter((_: unknown, i: number) => i % step === 0);
+
+      res.json({ ...result, equityCurve: thinCurve });
+    } catch (err) {
+      res.status(500).json({ error: 'backtest_failed', message: (err as Error).message });
+    }
+    return;
+  }));
+
+  // ── GET /api/v2/portfolio-summary ───────────────────────────────────
+  // H.7: aggregate risk metrics across all user bots.
+  router.get('/portfolio-summary', asyncHandler(async (req, res) => {
+    const userId = req.userId!;
+    const bots = await dbAll<{
+      id: number; pair: string; status: string; leverage: number;
+      investment_usdt: number; total_pnl_usdt: number;
+      grid_profit_usdt: number; trend_pnl_usdt: number;
+      position_size: number; avg_entry_price: number;
+    }>(db, `
+      SELECT id, pair, status, leverage, investment_usdt, total_pnl_usdt,
+             grid_profit_usdt, trend_pnl_usdt, position_size, avg_entry_price
+      FROM grid_bots
+      WHERE COALESCE(user_id, 1) = ? AND status != 'stopped'
+    `, [userId]);
+
+    let totalInvested = 0;
+    let totalEquity = 0;
+    let totalRealized = 0;
+    let totalUnrealized = 0;
+    let totalPositionUsdt = 0;
+    let weightedLeverage = 0;
+    const pairExposure: Record<string, number> = {};
+
+    for (const b of bots) {
+      const equity = b.investment_usdt + b.total_pnl_usdt;
+      const positionUsdt = b.position_size * b.avg_entry_price;
+      totalInvested += b.investment_usdt;
+      totalEquity += equity;
+      totalRealized += b.grid_profit_usdt;
+      totalUnrealized += b.trend_pnl_usdt;
+      totalPositionUsdt += positionUsdt;
+      weightedLeverage += b.leverage * b.investment_usdt;
+      pairExposure[b.pair] = (pairExposure[b.pair] ?? 0) + positionUsdt;
+    }
+
+    const avgLeverage = totalInvested > 0 ? weightedLeverage / totalInvested : 0;
+
+    res.json({
+      botCount: bots.length,
+      runningCount: bots.filter(b => b.status === 'running').length,
+      totalInvested: round(totalInvested, 2),
+      totalEquity: round(totalEquity, 2),
+      totalRealized: round(totalRealized, 2),
+      totalUnrealized: round(totalUnrealized, 2),
+      totalPnl: round(totalRealized + totalUnrealized, 2),
+      totalPnlPct: totalInvested > 0 ? round(((totalRealized + totalUnrealized) / totalInvested) * 100, 2) : 0,
+      totalPositionUsdt: round(totalPositionUsdt, 2),
+      avgLeverage: round(avgLeverage, 1),
+      pairExposure,
+    });
     return;
   }));
 

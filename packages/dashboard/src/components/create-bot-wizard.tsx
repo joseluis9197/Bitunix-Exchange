@@ -11,7 +11,7 @@
 // GRVT. We don't want a misclick on "Create" to immediately spend money.
 
 import { useState, type ReactNode } from 'react';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
@@ -49,6 +49,10 @@ interface WizardState {
   safeguardEnabled: boolean;
   safeguardThresholdPct: string;
   safeguardAction: 'pause' | 'pause_close';
+  slPct: string;
+  tpPct: string;
+  autoShiftEnabled: boolean;
+  autoShiftPct: string;
 }
 
 const INITIAL_STATE: WizardState = {
@@ -64,9 +68,14 @@ const INITIAL_STATE: WizardState = {
   safeguardEnabled: false,
   safeguardThresholdPct: '10',
   safeguardAction: 'pause',
+  slPct: '',
+  tpPct: '',
+  autoShiftEnabled: false,
+  autoShiftPct: '10',
 };
 
-const PAIRS = [
+// H.1: hardcoded fallback — used while the API query is loading
+const FALLBACK_PAIRS = [
   { value: 'ETH_USDT_Perp', label: 'ETH-USDT-Perp' },
   { value: 'BTC_USDT_Perp', label: 'BTC-USDT-Perp' },
 ];
@@ -79,6 +88,22 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
   const [state, setState] = useState<WizardState>(INITIAL_STATE);
   const [validated, setValidated] = useState<ValidateBotResult | null>(null);
   const navigate = useNavigate();
+
+  // H.1: fetch available instruments from GRVT API
+  const instrumentsQuery = useQuery({
+    queryKey: ['instruments'],
+    queryFn: () => api.getInstruments(),
+    staleTime: 60_000,
+    enabled: open,
+  });
+  const PAIRS = instrumentsQuery.data?.instruments
+    ? (instrumentsQuery.data.instruments as any[])
+        .filter((i: any) => i.instrument?.includes('_Perp') || i.symbol?.includes('_Perp'))
+        .map((i: any) => {
+          const name = i.instrument ?? i.symbol ?? i.name;
+          return { value: name, label: name.replace(/_/g, '-') };
+        })
+    : FALLBACK_PAIRS;
   const queryClient = useQueryClient();
 
   const validateMutation = useMutation({
@@ -127,6 +152,13 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
           safeguard_action: state.safeguardAction,
         }
       : {};
+    // H.3: SL/TP
+    const slPct = parseFloat(state.slPct || '0');
+    const tpPct = parseFloat(state.tpPct || '0');
+    // H.2: auto-shift
+    const autoShiftPayload = state.autoShiftEnabled
+      ? { auto_shift_enabled: true, auto_shift_pct: parseFloat(state.autoShiftPct || '10') }
+      : {};
     createMutation.mutate({
       pair: validated.pair,
       direction: validated.direction,
@@ -137,6 +169,9 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
       leverage: validated.input.leverage,
       ...(compoundPct > 0 ? { compound_pct: compoundPct } : {}),
       ...safeguardPayload,
+      ...(slPct > 0 ? { sl_pct: slPct } : {}),
+      ...(tpPct > 0 ? { tp_pct: tpPct } : {}),
+      ...autoShiftPayload,
     } as any);
   }
 
@@ -151,7 +186,11 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
       key !== 'compoundPct' &&
       key !== 'safeguardEnabled' &&
       key !== 'safeguardThresholdPct' &&
-      key !== 'safeguardAction'
+      key !== 'safeguardAction' &&
+      key !== 'slPct' &&
+      key !== 'tpPct' &&
+      key !== 'autoShiftEnabled' &&
+      key !== 'autoShiftPct'
     ) {
       setValidated(null);
     }
@@ -233,7 +272,7 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
     >
       <Stepper step={step} />
       <div className="mt-6">
-        {step === 0 && <StepPair state={state} update={update} />}
+        {step === 0 && <StepPair state={state} update={update} pairs={PAIRS} />}
         {step === 1 && <StepRange state={state} update={update} />}
         {step === 2 && <StepConfig state={state} update={update} />}
         {step === 3 && (
@@ -293,9 +332,11 @@ function Stepper({ step }: { step: Step }) {
 function StepPair({
   state,
   update,
+  pairs,
 }: {
   state: WizardState;
   update: <K extends keyof WizardState>(k: K, v: WizardState[K]) => void;
+  pairs: Array<{ value: string; label: string }>;
 }) {
   return (
     <div>
@@ -303,7 +344,7 @@ function StepPair({
         Select instrument
       </h3>
       <div className="grid grid-cols-2 gap-3">
-        {PAIRS.map((p) => {
+        {pairs.map((p) => {
           const selected = state.pair === p.value;
           return (
             <button
@@ -531,6 +572,58 @@ function StepConfig({
                 buffer — the real liquidation price may differ.
               </span>
             </p>
+          </div>
+        )}
+      </div>
+
+      {/* H.3: Stop-loss / Take-profit */}
+      <div className="mt-4 grid grid-cols-2 gap-4">
+        <Input
+          label="Stop-loss (%)"
+          numeric
+          inputMode="decimal"
+          value={state.slPct}
+          onChange={(e) => update('slPct', e.target.value)}
+          helper="Close bot if loss exceeds this % of investment. Empty = disabled."
+        />
+        <Input
+          label="Take-profit (%)"
+          numeric
+          inputMode="decimal"
+          value={state.tpPct}
+          onChange={(e) => update('tpPct', e.target.value)}
+          helper="Close bot if profit exceeds this % of investment. Empty = disabled."
+        />
+      </div>
+
+      {/* H.2: Auto-shift range */}
+      <div className="mt-4 rounded-md border border-border-subtle bg-bg-muted/40 p-4">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5 size-4 accent-primary"
+            checked={state.autoShiftEnabled}
+            onChange={(e) => update('autoShiftEnabled', e.target.checked)}
+          />
+          <div className="flex-1">
+            <div className="text-sm font-semibold text-text-primary">
+              Auto-shift range
+            </div>
+            <div className="text-xs text-text-muted mt-0.5">
+              Automatically recenter the grid when price moves beyond the range boundary.
+            </div>
+          </div>
+        </label>
+        {state.autoShiftEnabled && (
+          <div className="mt-3 pl-7">
+            <Input
+              label="Shift threshold (%)"
+              numeric
+              inputMode="decimal"
+              value={state.autoShiftPct}
+              onChange={(e) => update('autoShiftPct', e.target.value)}
+              helper="Trigger shift when price exits range by this % of range width"
+            />
           </div>
         )}
       </div>

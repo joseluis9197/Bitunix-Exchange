@@ -161,6 +161,25 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
+// H.1: dynamic instrument specs cache. Populated by getInstruments(),
+// with hardcoded fallbacks for ETH/BTC so the bot works even if the
+// API call fails or hasn't been made yet.
+export interface InstrumentSpec {
+  min_size: number;
+  min_notional: number;
+  tick_size: number;
+}
+
+const instrumentSpecsCache = new Map<string, InstrumentSpec>([
+  ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1 }],
+  ['ETH_USDT_Perp', { min_size: 0.01, min_notional: 20, tick_size: 0.01 }],
+]);
+
+/** Get instrument specs — falls back to conservative defaults for unknown pairs. */
+export function getInstrumentSpec(pair: string): InstrumentSpec {
+  return instrumentSpecsCache.get(pair) ?? { min_size: 0.01, min_notional: 20, tick_size: 0.01 };
+}
+
 /**
  * Explicit GRVT credentials passed to the constructor for multi-tenant
  * mode. When omitted, the client falls back to env vars (legacy path).
@@ -273,6 +292,20 @@ export class GRVTClient {
    */
   async getInstruments(): Promise<any[]> {
     const data = await publicRequest(`${MARKET_DATA_URL}/instruments`, {});
+    // H.1: cache instrument specs for dynamic pair support
+    if (Array.isArray(data)) {
+      for (const inst of data) {
+        const name = inst.instrument ?? inst.symbol ?? inst.name;
+        if (name && typeof name === 'string') {
+          const minSize = parseFloat(inst.base_min_size ?? inst.min_size ?? '0.01');
+          const minNotional = parseFloat(inst.quote_min_size ?? inst.min_notional ?? '20');
+          const tickSize = parseFloat(inst.tick_size ?? '0.01');
+          if (minSize > 0) {
+            instrumentSpecsCache.set(name, { min_size: minSize, min_notional: minNotional, tick_size: tickSize });
+          }
+        }
+      }
+    }
     return data;
   }
 
@@ -643,16 +676,8 @@ export class GRVTClient {
     const priceNum = parseFloat(price);
     const notional = sizeNum * priceNum;
 
-    // Specs verificadas por Marta
-    const instrumentSpecs: Record<string, { min_size: number; min_notional: number; tick_size: number }> = {
-      'BTC_USDT_Perp': { min_size: 0.001, min_notional: 100, tick_size: 0.1 },
-      'ETH_USDT_Perp': { min_size: 0.01, min_notional: 20, tick_size: 0.01 }
-    };
-
-    const specs = instrumentSpecs[instrument];
-    if (!specs) {
-      throw new Error(`Instrumento no soportado: ${instrument}`);
-    }
+    // H.1: dynamic specs from cache (populated by getInstruments, fallback hardcoded)
+    const specs = getInstrumentSpec(instrument);
 
     if (sizeNum < specs.min_size) {
       throw new Error(`Tamaño ${size} menor que min_size ${specs.min_size} para ${instrument}`);

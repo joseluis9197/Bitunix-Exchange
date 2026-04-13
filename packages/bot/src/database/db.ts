@@ -58,6 +58,17 @@ export interface GridBot {
   alert_drawdown_pct?: number | null;
   alert_fill_batch?: number | null;
   alert_liq_proximity_pct?: number | null;
+  // H.3: stop-loss / take-profit (null = disabled)
+  sl_pct?: number | null;
+  tp_pct?: number | null;
+  // H.2: dynamic grid auto-shift
+  auto_shift_enabled?: number;
+  auto_shift_pct?: number | null;
+  // H.4: DCA mode
+  bot_type?: 'grid' | 'dca';
+  dca_amount_usdt?: number | null;
+  dca_interval_hours?: number | null;
+  last_dca_at?: string | null;
 }
 
 export interface GridLevel {
@@ -337,6 +348,17 @@ export class GridBotDB {
       'alert_drawdown_pct REAL',
       'alert_fill_batch INTEGER',
       'alert_liq_proximity_pct REAL',
+      // H.3: stop-loss / take-profit
+      'sl_pct REAL',
+      'tp_pct REAL',
+      // H.2: dynamic grid auto-shift
+      'auto_shift_enabled INTEGER DEFAULT 0',
+      'auto_shift_pct REAL',
+      // H.4: DCA mode
+      "bot_type TEXT DEFAULT 'grid'",
+      'dca_amount_usdt REAL',
+      'dca_interval_hours REAL',
+      'last_dca_at TEXT',
     ]) {
       try { await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN ${col}`); } catch (e) { /* exists */ }
     }
@@ -598,6 +620,36 @@ export class GridBotDB {
       )
     `);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_terms_user ON terms_acceptances(user_id)`);
+
+    // H.5: sub-accounts — allows one user to connect multiple GRVT
+    // sub-accounts for strategy isolation. The existing grvt_credentials
+    // table remains as the "default" credentials. Sub-accounts extend it.
+    await this.dbRun(`
+      CREATE TABLE IF NOT EXISTS grvt_sub_accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT NOT NULL DEFAULT 'Default',
+        encrypted_api_key TEXT NOT NULL,
+        api_key_iv TEXT NOT NULL,
+        api_key_tag TEXT NOT NULL,
+        encrypted_api_secret TEXT NOT NULL,
+        api_secret_iv TEXT NOT NULL,
+        api_secret_tag TEXT NOT NULL,
+        encrypted_trading_address TEXT NOT NULL,
+        trading_address_iv TEXT NOT NULL,
+        trading_address_tag TEXT NOT NULL,
+        encrypted_account_id TEXT NOT NULL,
+        account_id_iv TEXT NOT NULL,
+        account_id_tag TEXT NOT NULL,
+        encrypted_sub_account_id TEXT NOT NULL,
+        sub_account_id_iv TEXT NOT NULL,
+        sub_account_id_tag TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        last_test_ok INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_sub_accounts_user ON grvt_sub_accounts(user_id)`);
 
     // ALTER existing tables to add user_id. Wrapped in try/catch
     // because SQLite doesn't support `ADD COLUMN IF NOT EXISTS`.

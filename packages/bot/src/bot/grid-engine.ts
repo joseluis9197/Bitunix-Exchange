@@ -1,7 +1,7 @@
 // Grid Trading Engine - Fase 3
 // Lógica completa de grid trading con safeguards para dinero real
 
-import { grvtClient, type GRVTClient } from '../api/client.js';
+import { grvtClient, type GRVTClient, getInstrumentSpec } from '../api/client.js';
 import { getGrvtClientForUser, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
@@ -95,13 +95,13 @@ function computeQtyPerLevel(
 ): number {
   const ORDER_ALLOC = 0.75;
   const effCap = investmentUsdt * leverage * ORDER_ALLOC;
-  const minSize = pair === 'BTC_USDT_Perp' ? 0.001 : 0.01;
+  const { min_size: minSize, min_notional: minNotional } = getInstrumentSpec(pair);
   let qty = Math.max(
     Math.ceil((effCap / numGrids / midPrice) * 100) / 100,
     0.03
   );
   // Ensure min notional at lowest likely price
-  const minNotional = pair === 'BTC_USDT_Perp' ? 100 : 20;
+  
   while (qty * midPrice * 0.8 < minNotional) {
     qty += minSize;
   }
@@ -144,6 +144,7 @@ export class GridEngine extends EventEmitter {
   private dailySnapshotInterval: NodeJS.Timeout | null = null; // ⚠️ NUEVO: Daily snapshots
   private compoundCheckInterval: NodeJS.Timeout | null = null;
   private fillPollingInterval: NodeJS.Timeout | null = null; // Phase B.10: Fill archive poller
+  private dcaCheckInterval: NodeJS.Timeout | null = null; // H.4: DCA buy check
   private isRunning = false;
 
   // C.5: track every async task spawned from an interval / setTimeout
@@ -288,6 +289,11 @@ export class GridEngine extends EventEmitter {
       }, 60 * 60 * 1000);
       log.info('🔄 Compound rebalance enabled (per-bot opt-in, checks every 1h)');
 
+      // H.4: DCA buy check every hour (same cadence as compound)
+      this.dcaCheckInterval = setInterval(() => {
+        this.track('checkDcaBuys', () => this.checkDcaBuys());
+      }, 60 * 60 * 1000);
+
       // ⚠️ NUEVO: Daily snapshots cada 24h (00:00 UTC)
       // Inline setup (method is on GridBotInstance, not GridEngine)
       const now = new Date();
@@ -374,6 +380,12 @@ export class GridEngine extends EventEmitter {
     if (this.fillPollingInterval) {
       clearInterval(this.fillPollingInterval);
       this.fillPollingInterval = null;
+    }
+
+    // H.4: clear DCA check
+    if (this.dcaCheckInterval) {
+      clearInterval(this.dcaCheckInterval);
+      this.dcaCheckInterval = null;
     }
 
     // C.5: drain in-flight async work before we let the caller close
@@ -781,6 +793,39 @@ export class GridEngine extends EventEmitter {
         }
       }
     }
+
+    // H.2: process auto-shift requests. Rate-limited to max once per
+    // hour per bot. Reuses updateBotRange() which has full safety checks.
+    for (const [botId, instance] of this.bots) {
+      const req = instance.autoShiftRequested;
+      if (!req) continue;
+      instance.autoShiftRequested = null;
+
+      // Rate limit: check last shift time stored as a tag in the instance
+      const lastShift = (instance as any)._lastAutoShiftAt ?? 0;
+      if (Date.now() - lastShift < 3600_000) continue; // max once/hour
+
+      const bot = instance.getBot();
+      const rangeWidth = bot.upper_price - bot.lower_price;
+      const newLower = Math.round((req.currentPrice - rangeWidth / 2) * 100) / 100;
+      const newUpper = Math.round((req.currentPrice + rangeWidth / 2) * 100) / 100;
+
+      log.info(
+        { botId, currentPrice: req.currentPrice, exitDist: req.exitDist, newLower, newUpper },
+        'auto-shift triggered'
+      );
+
+      try {
+        await this.updateBotRange(botId, newLower, newUpper);
+        (instance as any)._lastAutoShiftAt = Date.now();
+        log.info({ botId, newLower, newUpper }, 'auto-shift completed');
+      } catch (shiftErr) {
+        log.warn(
+          { botId, err: (shiftErr as Error).message },
+          'auto-shift failed (safety violation or error)'
+        );
+      }
+    }
   }
 
   /**
@@ -822,8 +867,8 @@ export class GridEngine extends EventEmitter {
     const ORDER_ALLOC = 0.75;
     const midPrice = (config.lowerPrice + config.upperPrice) / 2;
     const effCap = config.investmentUSDT * config.leverage * ORDER_ALLOC;
-    const minNotional = config.pair === 'ETH_USDT_Perp' ? 20 : 100;
-    const minSize = config.pair === 'ETH_USDT_Perp' ? 0.01 : 0.001;
+    const { min_notional: minNotional, min_size: minSize } = getInstrumentSpec(config.pair);
+    
     let canonicalQty = Math.max(
       Math.ceil((effCap / config.numGrids / midPrice) * 100) / 100,
       0.03
@@ -920,7 +965,7 @@ export class GridEngine extends EventEmitter {
     // ⚠️ NUEVO: Validar min_notional por grid (con leverage)
     const effectiveCapital = config.investmentUSDT * config.leverage;
     const investmentPerGrid = effectiveCapital / config.numGrids;
-    const minNotional = config.pair === 'ETH_USDT_Perp' ? 20 : 100;
+    const { min_notional: minNotional, min_size: minSize } = getInstrumentSpec(config.pair);
     
     if (investmentPerGrid < minNotional) {
       const maxGrids = Math.floor((config.investmentUSDT * config.leverage) / minNotional);
@@ -934,7 +979,7 @@ export class GridEngine extends EventEmitter {
    * NUEVO: Calcular máximo número de grids para una inversión y par
    */
   static calculateMaxGrids(investmentUSDT: number, pair: string): number {
-    const minNotional = pair === 'ETH_USDT_Perp' ? 20 : 100;
+    const { min_notional: minNotional } = getInstrumentSpec(pair);
     return Math.floor(investmentUSDT / minNotional);
   }
 
@@ -1134,6 +1179,59 @@ export class GridEngine extends EventEmitter {
 
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ Error en backfill funding history:`);
+    }
+  }
+
+  /**
+   * H.4: DCA mode — for bots with bot_type='dca', place a market buy
+   * on schedule. Runs hourly (same cadence as compound rebalance).
+   */
+  private async checkDcaBuys(): Promise<void> {
+    try {
+      const activeBots = await db.getBotsByStatus('running');
+      for (const bot of activeBots) {
+        if (bot.bot_type !== 'dca') continue;
+        if (!bot.dca_amount_usdt || !bot.dca_interval_hours) continue;
+
+        const lastDca = bot.last_dca_at ? new Date(bot.last_dca_at).getTime() : 0;
+        const hoursSince = (Date.now() - lastDca) / (1000 * 60 * 60);
+        if (hoursSince < bot.dca_interval_hours) continue;
+
+        log.info({ botId: bot.id, pair: bot.pair, amount: bot.dca_amount_usdt }, 'DCA buy triggered');
+
+        try {
+          const client = await this.getClientForBot(bot);
+          const ticker = await client.getTicker(bot.pair);
+          const price = parseFloat(ticker.last_price);
+          const { min_size: minSize } = getInstrumentSpec(bot.pair);
+          const size = Math.max(minSize, Math.floor((bot.dca_amount_usdt / price) * 10000) / 10000);
+
+          // Aggressive limit (0.5% above market) to ensure fill
+          const aggressivePrice = Math.ceil(price * 1.005 * 100) / 100;
+
+          await client.createOrder({
+            sub_account_id: client.subAccountId,
+            instrument: bot.pair,
+            size: size.toString(),
+            price: aggressivePrice.toString(),
+            side: 'buy',
+            type: 'limit',
+            time_in_force: 'ioc',
+            metadata: `dca_${bot.id}_${Date.now()}`,
+          }, true);
+
+          await db.updateBot(bot.id, {
+            last_dca_at: new Date().toISOString(),
+            position_size: bot.position_size + size,
+          } as any);
+
+          log.info({ botId: bot.id, size, price: aggressivePrice }, 'DCA buy executed');
+        } catch (buyErr) {
+          log.error({ botId: bot.id, err: (buyErr as Error).message }, 'DCA buy failed');
+        }
+      }
+    } catch (err) {
+      log.error({ err: (err as Error).message }, 'DCA check error');
     }
   }
 
@@ -1676,6 +1774,8 @@ export class GridBotInstance {
   private gridLevels: GridLevel[] = [];
   private activeOrders = new Map<string, OrderRecord>();
   private processedFills = new Set<string>(); // ⚠️ NUEVO: Deduplicación de fills
+  // H.2: set by monitor() when price exits range; consumed by engine's auto-shift check
+  autoShiftRequested: { currentPrice: number; exitDist: number } | null = null;
   // Multi-tenant: per-user GRVT client resolved by GridEngine via
   // getClientForBot(). Falls back to the module-level `grvtClient`
   // singleton only for legacy bots with no user_id (the factory
@@ -1863,7 +1963,7 @@ export class GridBotInstance {
     log.info(`💰 [DEBUG] Bot ${this.bot.id}: Notional USDT: $${notionalUSDT.toFixed(2)}`);
 
     // Validar min_notional
-    const minNotional = this.bot.pair === 'ETH_USDT_Perp' ? 20 : 100;
+    const { min_notional: minNotional } = getInstrumentSpec(this.bot.pair);
     if (notionalUSDT < minNotional) {
       log.info(`⚠️ [DEBUG] Bot ${this.bot.id}: Notional $${notionalUSDT.toFixed(2)} < min_notional $${minNotional}, saltando compra inicial`);
       return;
@@ -2009,7 +2109,7 @@ export class GridBotInstance {
     try {
       // ⚠️ VALIDAR MIN_NOTIONAL antes de colocar orden
       const notional = level.quantity * level.price;
-      const minNotional = this.bot.pair === 'ETH_USDT_Perp' ? 20 : 100; // ETH: $20, BTC: $100
+      const { min_notional: minNotional } = getInstrumentSpec(this.bot.pair);
       
       if (notional < minNotional) {
         log.info(`⚠️ [DEBUG] SKIP nivel ${level.level_index}: notional $${notional.toFixed(2)} < min_notional $${minNotional}`);
@@ -2175,6 +2275,26 @@ export class GridBotInstance {
           throw new Error(
             `SAFEGUARD:${action}:bot=${this.bot.id}:dist=${distancePct.toFixed(2)}%:liq=${liq.toFixed(2)}:mark=${currentPrice.toFixed(2)}`
           );
+        }
+      }
+    }
+
+    // H.2: auto-shift detection. If price is beyond the range by more
+    // than auto_shift_pct of the range width, request a range re-center.
+    // This is checked every tick but the actual shift is rate-limited
+    // in the engine's handler (max once per hour per bot).
+    if (this.bot.auto_shift_enabled && this.bot.auto_shift_pct) {
+      const rangeWidth = this.bot.upper_price - this.bot.lower_price;
+      if (rangeWidth > 0) {
+        const aboveRange = currentPrice > this.bot.upper_price;
+        const belowRange = currentPrice < this.bot.lower_price;
+        if (aboveRange || belowRange) {
+          const exitDist = aboveRange
+            ? ((currentPrice - this.bot.upper_price) / rangeWidth) * 100
+            : ((this.bot.lower_price - currentPrice) / rangeWidth) * 100;
+          if (exitDist >= this.bot.auto_shift_pct) {
+            this.autoShiftRequested = { currentPrice, exitDist };
+          }
         }
       }
     }
@@ -2705,6 +2825,26 @@ export class GridBotInstance {
         position_size: positionSize,
         avg_entry_price: avgEntryPrice
       });
+
+      // H.3: Stop-loss / take-profit check (after PnL is persisted).
+      // Uses the same SAFEGUARD throw pattern as C.4 — monitorAllBots()
+      // catches it and routes to closeBot().
+      if (this.bot.sl_pct != null && this.bot.investment_usdt > 0) {
+        const lossPct = (totalPnl / this.bot.investment_usdt) * -100;
+        if (totalPnl < 0 && lossPct >= this.bot.sl_pct) {
+          throw new Error(
+            `SAFEGUARD:pause_close:bot=${this.bot.id}:SL triggered at -${lossPct.toFixed(1)}% (threshold ${this.bot.sl_pct}%)`
+          );
+        }
+      }
+      if (this.bot.tp_pct != null && this.bot.investment_usdt > 0) {
+        const gainPct = (totalPnl / this.bot.investment_usdt) * 100;
+        if (totalPnl > 0 && gainPct >= this.bot.tp_pct) {
+          throw new Error(
+            `SAFEGUARD:pause_close:bot=${this.bot.id}:TP triggered at +${gainPct.toFixed(1)}% (threshold ${this.bot.tp_pct}%)`
+          );
+        }
+      }
 
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ Error actualizando PnL bot ${this.bot.id}:`);

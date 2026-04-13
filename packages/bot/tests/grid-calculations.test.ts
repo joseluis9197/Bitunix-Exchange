@@ -54,6 +54,11 @@ const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
 vi.mock('../src/api/client.js', () => ({
   grvtClient: mockGrvtClient,
   GRVTClient: vi.fn(),
+  getInstrumentSpec: (pair: string) => {
+    if (pair === 'BTC_USDT_Perp') return { min_size: 0.001, min_notional: 100, tick_size: 0.1 };
+    return { min_size: 0.01, min_notional: 20, tick_size: 0.01 };
+  },
+  InstrumentSpec: {},
 }));
 
 vi.mock('../src/api/grvt-client-factory.js', () => ({
