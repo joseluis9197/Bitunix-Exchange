@@ -23,6 +23,11 @@ export interface GridConfig {
   upperPrice: number;
   numGrids: number;
   investmentUSDT: number;
+  // H.8: Virtual grids. When true, bot keeps only `activeWindowSize` levels
+  // closest to market as real orders on GRVT; the rest are virtual (in DB
+  // only). Rotation happens automatically as price moves.
+  virtualEnabled?: boolean;
+  activeWindowSize?: number;
 }
 
 export interface GridCalculation {
@@ -261,6 +266,17 @@ export class GridEngine extends EventEmitter {
     }
 
     try {
+      // H.8: warmup — populate the instrument specs cache so the order signer
+      // has instrument_hash + base_decimals for any pair we may trade (SOL,
+      // DOGE, etc.), not just the hardcoded ETH/BTC fallbacks. Uses the
+      // module-level singleton (no auth needed for public /instruments endpoint).
+      try {
+        await grvtClient.getInstruments();
+        log.info('📚 Instrument specs cache populated');
+      } catch (err) {
+        log.warn({ err: (err as Error).message }, 'Failed to warm up instrument cache; will rely on fallbacks');
+      }
+
       // Cargar bots activos de la database
       await this.loadActiveBots();
       
@@ -294,15 +310,27 @@ export class GridEngine extends EventEmitter {
         this.track('checkDcaBuys', () => this.checkDcaBuys());
       }, 60 * 60 * 1000);
 
-      // ⚠️ NUEVO: Daily snapshots cada 24h (00:00 UTC)
-      // Inline setup (method is on GridBotInstance, not GridEngine)
+      // Daily snapshots: boot snapshot in 10s, then every 24h at midnight UTC
       const now = new Date();
       const tomorrow = new Date(now);
       tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
       tomorrow.setUTCHours(0, 0, 0, 0);
       const msUntilMidnight = tomorrow.getTime() - now.getTime();
+
+      // Boot snapshot (10s delay so auth + first monitor pass complete)
+      setTimeout(() => {
+        this.track('dailySnapshots', () => this.runDailySnapshotsForAllBots());
+      }, 10_000);
+
+      // Schedule at midnight UTC, then every 24h
+      setTimeout(() => {
+        this.track('dailySnapshots', () => this.runDailySnapshotsForAllBots());
+        this.dailySnapshotInterval = setInterval(() => {
+          this.track('dailySnapshots', () => this.runDailySnapshotsForAllBots());
+        }, 24 * 60 * 60 * 1000);
+      }, msUntilMidnight);
+
       log.info(`📸 Daily snapshots configurados - próximo en ${Math.round(msUntilMidnight / 1000 / 3600)} horas`);
-      // Note: actual snapshot logic is in GridBotInstance.createDailySnapshots()
 
       // ⚠️ NUEVO: Backfill inicial de funding history
       setTimeout(() => {
@@ -424,6 +452,9 @@ export class GridEngine extends EventEmitter {
       // (which read getFixedQty() → bot.quantity_per_level) go in at
       // another, causing position drift. The fix here ensures there is
       // exactly one source of truth: calculation.quantityPerGrid.
+      const virtualEnabled = !!config.virtualEnabled;
+      const activeWindowSize = virtualEnabled ? (config.activeWindowSize ?? 70) : null;
+
       const botId = await db.createBot({
         // Default to user 1 (owner) when caller omits — admin
         // scripts and legacy code paths get the right behavior.
@@ -443,6 +474,8 @@ export class GridEngine extends EventEmitter {
         position_size: 0,
         avg_entry_price: 0,
         liquidation_price: calculation.liquidationPrice,
+        virtual_enabled: virtualEnabled ? 1 : 0,
+        active_window_size: activeWindowSize,
         params_json: JSON.stringify({
           spacing: calculation.spacing,
           quantityPerGrid: calculation.quantityPerGrid,
@@ -450,15 +483,35 @@ export class GridEngine extends EventEmitter {
         })
       });
 
+      // H.8: determine which levels are initially active vs virtual.
+      // Midpoint of the grid approximates the initial current price; the M
+      // closest levels to that midpoint become active, the rest virtual.
+      // Once the bot starts, rotateVirtualWindow() realigns to the real
+      // price on the first monitor tick — this initial assignment just
+      // primes the DB so executeInitialPurchase sees the correct state.
+      const midPrice = (config.lowerPrice + config.upperPrice) / 2;
+      const activeIdxSet = new Set<number>();
+      if (virtualEnabled && activeWindowSize) {
+        const sortedByDist = [...calculation.gridLevels]
+          .map((l) => ({ idx: l.index, dist: Math.abs(l.price - midPrice) }))
+          .sort((a, b) => a.dist - b.dist)
+          .slice(0, activeWindowSize);
+        for (const s of sortedByDist) activeIdxSet.add(s.idx);
+      }
+
       // Guardar grid levels en database
       for (const level of calculation.gridLevels) {
+        const initialState: 'active' | 'virtual' = virtualEnabled && !activeIdxSet.has(level.index)
+          ? 'virtual'
+          : 'active';
         await db.createGridLevel({
           bot_id: botId,
           level_index: level.index,
           price: level.price,
           side: level.side,
           quantity: level.quantity,
-          is_filled: false
+          is_filled: false,
+          state: initialState,
         });
       }
 
@@ -553,18 +606,52 @@ export class GridEngine extends EventEmitter {
         existingPosition && (existingPosition as any).size
           ? Math.abs(parseFloat((existingPosition as any).size))
           : 0;
-      const hasExistingState = existingOrders.length > 0 || positionSize > 0;
+
+      // Check if existing GRVT state actually matches THIS bot's grid levels.
+      // A user may have orphan orders on the pair from a previously-deleted
+      // bot; those should NOT trigger RESUME path because they don't belong
+      // to us. Only trigger RESUME when orders price-match our grid OR there's
+      // a real position.
+      const botGridLevels = await db.getGridLevels(botId);
+      const gridPrices = botGridLevels.map((l) => Math.round(l.price * 100) / 100);
+      let matchingOrders = 0;
+      for (const order of existingOrders) {
+        const leg = (order as any).legs?.[0];
+        if (!leg?.limit_price) continue;
+        const op = Math.round(parseFloat(leg.limit_price) * 100) / 100;
+        if (gridPrices.some((gp) => Math.abs(gp - op) < 0.5)) matchingOrders++;
+      }
+      const orphanOrders = existingOrders.length - matchingOrders;
+      const hasOurState = matchingOrders > 0 || positionSize > 0;
 
       const instance = new GridBotInstance(bot, client);
       this.bots.set(botId, instance);
 
-      if (hasExistingState) {
+      if (orphanOrders > 0) {
+        log.warn(
+          `⚠️ Bot ${botId}: ${orphanOrders} orphan orders on ${bot.pair} don't match our grid. They will be cancelled by the duplicate killer / rotation.`
+        );
+      }
+
+      if (hasOurState) {
         log.info(
-          `🔁 Bot ${botId} RESUME — found ${existingOrders.length} open orders + position size ${positionSize}. Skipping bootstrap.`
+          `🔁 Bot ${botId} RESUME — ${matchingOrders} matching orders + position ${positionSize}. Skipping bootstrap.`
         );
         await this.resumeBotInstance(bot, instance, existingOrders);
       } else {
-        log.info(`🆕 Bot ${botId} FRESH START — no existing GRVT state, bootstrapping.`);
+        if (existingOrders.length > 0) {
+          log.info(
+            `🧹 Bot ${botId}: ${existingOrders.length} orphan orders found (none match our grid). Cancelling before bootstrap.`
+          );
+          for (const order of existingOrders) {
+            try {
+              await client.cancelOrder(order.order_id, bot.pair);
+            } catch (err) {
+              log.warn({ err: (err as Error).message }, 'cancel orphan fail');
+            }
+          }
+        }
+        log.info(`🆕 Bot ${botId} FRESH START — no matching GRVT state, bootstrapping.`);
         // Verificar balance antes de iniciar
         await this.validateSufficientBalance(bot);
         // Establecer leverage
@@ -601,6 +688,7 @@ export class GridEngine extends EventEmitter {
     await instance.loadGridLevels();
 
     const gridLevels = instance.getGridLevels();
+    const matchedLevelIds = new Set<number>();
     for (const grvtOrder of openOrders) {
       const leg = (grvtOrder as any).legs?.[0];
       if (!leg) continue;
@@ -612,6 +700,7 @@ export class GridEngine extends EventEmitter {
       // Match by price (closest level within $0.50)
       const matchingLevel = gridLevels.find((l) => Math.abs(l.price - price) < 0.5);
       if (matchingLevel) {
+        matchedLevelIds.add(matchingLevel.id);
         instance.setActiveOrder(String(clientId), {
           order_id: String(clientId),
           grid_level_id: matchingLevel.id,
@@ -620,6 +709,17 @@ export class GridEngine extends EventEmitter {
           price: matchingLevel.price,
           metadata: String(clientId),
         } as any);
+      }
+    }
+
+    // H.8: reconcile virtual state on resume. Any level marked 'active' in DB
+    // that doesn't have a corresponding order in GRVT is reset to 'virtual'
+    // so rotateVirtualWindow re-activates it cleanly if in-window.
+    if (bot.virtual_enabled) {
+      for (const level of gridLevels) {
+        if (level.state === 'active' && !matchedLevelIds.has(level.id) && !level.is_filled) {
+          await db.updateGridLevel(level.id, { state: 'virtual', order_id: null });
+        }
       }
     }
 
@@ -635,6 +735,13 @@ export class GridEngine extends EventEmitter {
     try {
       const instance = this.bots.get(botId);
       if (instance) {
+        // H.8: signal any in-flight placeInitialOrders loop to abort
+        instance.bootstrapAbort = true;
+        // Give it a brief moment to honor the abort before cancelling
+        if (instance.bootstrapInProgress) {
+          log.info(`⏳ Bot ${botId}: waiting for bootstrap to abort before cancelling orders...`);
+          await new Promise((r) => setTimeout(r, 500));
+        }
         await instance.cancelAllOrders();
         this.bots.delete(botId);
       }
@@ -945,22 +1052,25 @@ export class GridEngine extends EventEmitter {
       throw new Error('Precio inferior debe ser menor que precio superior');
     }
 
-    if (config.numGrids < 10 || config.numGrids > 95) {
-      throw new Error('Número de rejillas debe estar entre 10 y 95 (límite GRVT: 100 open orders)');
+    // H.8: virtual grids unlock up to 500 (vs 95 cap for legacy).
+    const maxGridsAllowed = config.virtualEnabled ? 500 : 95;
+    if (config.numGrids < 2 || config.numGrids > maxGridsAllowed) {
+      throw new Error(`Número de rejillas debe estar entre 2 y ${maxGridsAllowed}${config.virtualEnabled ? ' (virtual grids)' : ' (GRVT 80 open orders cap)'}`);
     }
 
-    if (config.leverage < 1 || config.leverage > 20) {
-      throw new Error('Leverage debe estar entre 1x y 20x');
+    if (config.leverage < 1 || config.leverage > 50) {
+      throw new Error('Leverage debe estar entre 1x y 50x');
     }
 
     if (config.investmentUSDT < 50) {
       throw new Error('Inversión mínima: $50 USDT');
     }
 
-    const supportedPairs = ['BTC_USDT_Perp', 'ETH_USDT_Perp'];
-    if (!supportedPairs.includes(config.pair)) {
-      throw new Error(`Par no soportado: ${config.pair}`);
-    }
+    // H.1: pairs are now dynamic from GRVT API. The instrument spec cache
+    // is populated by getInstruments() on first call. If the pair isn't
+    // in the cache, we validate via the fallback getInstrumentSpec() which
+    // returns safe defaults. Any pair with min_size/min_notional > 0 is
+    // acceptable here; per-bot validation happens on order placement.
 
     // ⚠️ NUEVO: Validar min_notional por grid (con leverage)
     const effectiveCapital = config.investmentUSDT * config.leverage;
@@ -1180,6 +1290,31 @@ export class GridEngine extends EventEmitter {
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ Error en backfill funding history:`);
     }
+  }
+
+  /**
+   * Create daily snapshots for ALL active bots. Runs from GridEngine
+   * (not GridBotInstance) so it covers every bot, not just one.
+   */
+  private async runDailySnapshotsForAllBots(): Promise<void> {
+    const today = new Date().toISOString().split('T')[0]!;
+    log.info(`📸 Creando daily snapshots para ${today}...`);
+    const activeBots = await db.getBotsByStatus('running');
+    for (const bot of activeBots) {
+      try {
+        const exists = await db.hasSnapshotForDate(bot.id, today);
+        if (exists) {
+          log.info(`📸 Snapshot ya existe para bot ${bot.id} fecha ${today}`);
+          continue;
+        }
+        const instance = this.bots.get(bot.id);
+        if (!instance) continue;
+        await instance.createDailySnapshots();
+      } catch (err) {
+        log.error({ err: (err as Error).message }, `📸 Error snapshot bot ${bot.id}`);
+      }
+    }
+    log.info(`✅ Daily snapshots completados para ${today}`);
   }
 
   /**
@@ -1655,6 +1790,9 @@ export class GridEngine extends EventEmitter {
     });
 
     // Step 5: Place new orders, throttled.
+    // H.8: if virtual_enabled, only activate the M closest levels. The rest
+    // remain in DB as virtual and will be activated by rotateVirtualWindow
+    // as price moves. Skip the gap level (closest to price) in both cases.
     const instance = this.bots.get(plan.botId);
     if (instance) {
       // Refresh the bot instance's in-memory state from DB so it sees
@@ -1665,9 +1803,45 @@ export class GridEngine extends EventEmitter {
       await instance.loadGridLevels();
 
       const newLevelsFromDb = await db.getGridLevels(plan.botId);
-      for (const level of newLevelsFromDb) {
+      const virtualEnabled = !!freshBot?.virtual_enabled;
+      const windowSize = freshBot?.active_window_size ?? 70;
+
+      // Find the "gap" level and (for virtual) determine which levels are
+      // within the active window.
+      let gapIndex = -1;
+      let gapDist = Infinity;
+      for (let i = 0; i < newLevelsFromDb.length; i++) {
+        const lvl = newLevelsFromDb[i];
+        if (!lvl) continue;
+        const d = Math.abs(lvl.price - plan.currentPrice);
+        if (d < gapDist) { gapDist = d; gapIndex = i; }
+      }
+
+      const activeIdsForRange = new Set<number>();
+      if (virtualEnabled) {
+        const sorted = newLevelsFromDb
+          .filter((l) => l)
+          .map((l) => ({ id: l.id, dist: Math.abs(l.price - plan.currentPrice) }))
+          .sort((a, b) => a.dist - b.dist)
+          .slice(0, windowSize);
+        for (const s of sorted) activeIdsForRange.add(s.id);
+      }
+
+      for (let i = 0; i < newLevelsFromDb.length; i++) {
+        const level = newLevelsFromDb[i];
+        if (!level) continue;
+        if (i === gapIndex) {
+          log.info(`⏭️ Skipped gap level @ $${level.price} (closest to market $${plan.currentPrice.toFixed(2)})`);
+          continue;
+        }
+        if (virtualEnabled && !activeIdsForRange.has(level.id)) {
+          // Out-of-window: mark virtual, don't place
+          await db.updateGridLevel(level.id, { state: 'virtual', order_id: null });
+          continue;
+        }
         try {
           await instance.placeGridOrder(level);
+          await db.updateGridLevel(level.id, { state: 'active' });
           log.info(`✅ Placed: ${level.side} @ $${level.price}`);
           await new Promise((r) => setTimeout(r, 500)); // throttle
         } catch (placeErr) {
@@ -1776,6 +1950,21 @@ export class GridBotInstance {
   private processedFills = new Set<string>(); // ⚠️ NUEVO: Deduplicación de fills
   // H.2: set by monitor() when price exits range; consumed by engine's auto-shift check
   autoShiftRequested: { currentPrice: number; exitDist: number } | null = null;
+  // H.8: bootstrap guard. When placeInitialOrders() is running, the monitor()
+  // tick must skip this bot, otherwise the "uncovered level" detection re-places
+  // orders that are in-flight and haven't yet appeared in GRVT's openOrders.
+  // That caused 91-95 duplicate orders on bot 46 during its initial bootstrap.
+  bootstrapInProgress = false;
+  // Set by pauseBot()/closeBot() to signal placeInitialOrders to abort
+  // its in-flight for-loop. Without this, closing a bot mid-bootstrap
+  // lets the loop keep placing orders for seconds after the "close".
+  bootstrapAbort = false;
+  // Tracks levelId → timestamp of the last placeGridOrder call. Used by
+  // monitor() to avoid re-placing orders that are in the short (~10s)
+  // window where GRVT openOrders hasn't caught up yet. After 10s, the
+  // level is treated normally — if GRVT still doesn't show it, the order
+  // was cancelled or filled, and the normal flow takes over.
+  private recentlyPlaced = new Map<number, number>();
   // Multi-tenant: per-user GRVT client resolved by GridEngine via
   // getClientForBot(). Falls back to the module-level `grvtClient`
   // singleton only for legacy bots with no user_id (the factory
@@ -1877,6 +2066,16 @@ export class GridBotInstance {
    */
   async placeInitialOrders(): Promise<void> {
     log.info(`🚀 [DEBUG] Bot ${this.bot.id}: INICIANDO placeInitialOrders()`);
+    this.bootstrapInProgress = true;
+    try {
+      await this._placeInitialOrdersInner();
+    } finally {
+      // Allow GRVT a few ticks to propagate before the monitor touches it
+      setTimeout(() => { this.bootstrapInProgress = false; }, 15_000);
+    }
+  }
+
+  private async _placeInitialOrdersInner(): Promise<void> {
     
     // Cargar niveles de grid
     this.gridLevels = await db.getGridLevels(this.bot.id);
@@ -1904,13 +2103,45 @@ export class GridBotInstance {
     let ordersPlaced = 0;
     let ordersSkipped = 0;
 
-    // ⚠️ PASO 2: Colocar órdenes limit según la dirección
+    // Identify the "gap" level: closest to current price. This level must NOT
+    // have an order placed on bootstrap — it represents the position entry
+    // point (the last implied fill). Placing an order there would fill at
+    // market immediately and burn fees. The counter-order flow will eventually
+    // place an order here when price moves and an adjacent level fills.
+    let gapLevelId = -1;
+    {
+      let minDist = Infinity;
+      for (const level of this.gridLevels) {
+        if (level.is_filled) continue;
+        if (this.bot.virtual_enabled && level.state === 'virtual') continue;
+        const d = Math.abs(level.price - currentPrice);
+        if (d < minDist) { minDist = d; gapLevelId = level.id; }
+      }
+      if (gapLevelId !== -1) {
+        const gapLevel = this.gridLevels.find((l) => l.id === gapLevelId);
+        log.info(`🕳️ Bot ${this.bot.id}: gap level @ $${gapLevel?.price} (dist=$${minDist.toFixed(4)}) — will be left empty`);
+        await db.updateGridLevel(gapLevelId, { is_filled: true, state: 'filled' });
+      }
+    }
+
+    // ⚠️ PASO 2: Colocar órdenes limit según la dirección.
+    // H.8: si virtual_enabled, SOLO colocar órdenes para niveles state='active'.
+    // Los 'virtual' se dejan sin orden (rotateVirtualWindow los activará si entran al window).
     for (const level of this.gridLevels) {
-      log.info(`🔍 [DEBUG] Bot ${this.bot.id}: Evaluando nivel ${level.level_index}: ${level.side} ${level.quantity} @ $${level.price} (filled: ${level.is_filled})`);
-      
-      if (level.is_filled) {
+      if (this.bootstrapAbort) {
+        log.warn(`🛑 Bot ${this.bot.id}: bootstrap aborted mid-loop (pause/close requested). Stopping placement.`);
+        break;
+      }
+      log.info(`🔍 [DEBUG] Bot ${this.bot.id}: Evaluando nivel ${level.level_index}: ${level.side} ${level.quantity} @ $${level.price} (filled: ${level.is_filled}, state: ${level.state ?? 'active'})`);
+
+      if (level.is_filled || level.id === gapLevelId) {
         ordersSkipped++;
-        log.info(`⏭️ [DEBUG] Bot ${this.bot.id}: Nivel ${level.level_index} ya está filled, saltando`);
+        log.info(`⏭️ [DEBUG] Bot ${this.bot.id}: Nivel ${level.level_index} saltado (filled/gap)`);
+        continue;
+      }
+
+      if (this.bot.virtual_enabled && level.state === 'virtual') {
+        ordersSkipped++;
         continue;
       }
 
@@ -1944,8 +2175,12 @@ export class GridBotInstance {
   private async executeInitialPurchase(currentPrice: number): Promise<void> {
     log.info(`💰 [DEBUG] Bot ${this.bot.id}: INICIANDO compra inicial para estrategia LONG`);
 
-    // Calcular niveles SELL arriba del precio actual
-    const sellLevelsAbove = this.gridLevels.filter(level => 
+    // Calcular niveles SELL arriba del precio actual.
+    // H.8: INCLUYE niveles virtuales (no filtramos por state). La compra inicial
+    // debe comprar el ETH suficiente para respaldar TODOS los sells conceptuales,
+    // incluso los que todavía no tienen orden puesta en GRVT. Cuando la rotación
+    // los active, la posición ya está disponible sin tener que market-buy extra.
+    const sellLevelsAbove = this.gridLevels.filter(level =>
       level.price > currentPrice && !level.is_filled
     ).sort((a, b) => a.price - b.price);
 
@@ -2042,22 +2277,12 @@ export class GridBotInstance {
         log.info(`⚠️ [REAL] Bot ${this.bot.id}: Compra inicial no se ejecutó completamente, continuando con órdenes limit`);
       }
 
-      // IMPORTANTE: Colocar SELL en el nivel justo arriba del precio de entry
-      // Esto cierra el "gap" que queda entre los BUYs de abajo y los SELLs de arriba
-      const entryLevel = this.gridLevels
-        .filter(l => l.price > currentPrice)
-        .sort((a, b) => a.price - b.price)[0];
-      
-      if (entryLevel) {
-        log.info(`📍 [DEBUG] Bot ${this.bot.id}: Colocando SELL en nivel de entry $${entryLevel.price} (cierra gap)`);
-        try {
-          const entryOrder = { ...entryLevel, side: 'sell' as const };
-          await this.placeGridOrder(entryOrder);
-          log.info(`✅ Bot ${this.bot.id}: SELL de entry colocada en $${entryLevel.price}`);
-        } catch (err) {
-          log.info(`⚠️ Bot ${this.bot.id}: No se pudo colocar SELL de entry: ${err}`);
-        }
-      }
+      // NOTE: we used to place a SELL here at the first level above current price
+      // "to close the gap". That was a duplicate — the main loop in placeInitialOrders
+      // already places orders at every active SELL level (including the one right
+      // above price). The new gap logic marks only the level CLOSEST to current
+      // price (not the nearest-above) as the empty slot. Removing the redundant
+      // placement fixed the duplicate orders user reported on bot 47.
 
     } catch (error) {
       log.error({ err: (error as Error).message }, `❌ [DEBUG] Error en compra inicial para bot ${this.bot.id}:`);
@@ -2099,18 +2324,111 @@ export class GridBotInstance {
   }
 
   /**
+   * H.8 Virtual Grids — slide the active window to follow price.
+   *
+   * When virtual_enabled, only the M levels closest to `currentPrice` should
+   * have orders on GRVT. Others stay in DB with state='virtual' (no order).
+   * This method reconciles DB state with where the window SHOULD be right now:
+   *   - Levels inside the window that are 'virtual' → place order, mark 'active'
+   *   - Levels outside the window that are 'active' → cancel order, mark 'virtual'
+   *   - 'filled' levels don't rotate (the counter-order flow handles them)
+   *
+   * Rate-limited to MAX_OPS_PER_TICK cancels + MAX_OPS_PER_TICK placements per
+   * call, so a big price gap converges over several ticks without saturating
+   * GRVT's rate limit. Always cancels BEFORE placing to leave room under the
+   * 80-order cap.
+   */
+  private async rotateVirtualWindow(currentPrice: number, currentOpenOrders: number): Promise<void> {
+    const M = this.bot.active_window_size ?? 70;
+    const MAX_OPS_PER_TICK = 5;
+
+    const allLevels = await db.getGridLevels(this.bot.id);
+    const rotatable = allLevels
+      .filter((l) => l.state !== 'filled')
+      .map((l) => ({ level: l, dist: Math.abs(l.price - currentPrice) }))
+      .sort((a, b) => a.dist - b.dist);
+
+    // Top M closest levels should be active
+    const wantActiveIds = new Set(rotatable.slice(0, M).map((r) => r.level.id));
+
+    const toVirtualize: typeof rotatable = [];
+    const toActivate: typeof rotatable = [];
+
+    for (const r of rotatable) {
+      const shouldBeActive = wantActiveIds.has(r.level.id);
+      const isActive = r.level.state === 'active' || r.level.state === undefined;
+      if (shouldBeActive && r.level.state === 'virtual') {
+        toActivate.push(r);
+      } else if (!shouldBeActive && isActive && r.level.order_id &&
+                 r.level.order_id !== '0x00' && r.level.order_id !== '') {
+        toVirtualize.push(r);
+      }
+    }
+
+    if (toVirtualize.length === 0 && toActivate.length === 0) return;
+
+    // Cancel far-away orders first (frees room under GRVT's 80-order cap)
+    let virtualized = 0;
+    for (const r of toVirtualize.slice(0, MAX_OPS_PER_TICK)) {
+      try {
+        await this.grvt.cancelOrder(r.level.order_id!, this.bot.pair);
+        await db.updateGridLevel(r.level.id, { state: 'virtual', order_id: null });
+        virtualized++;
+        log.info(`🌫️ Virtualized ${r.level.side} @ $${r.level.price} (dist=$${r.dist.toFixed(2)})`);
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, `virtualize fail @ $${r.level.price}`);
+      }
+    }
+
+    // Then place new orders for newly in-window levels
+    let activated = 0;
+    // Stay conservative about not exceeding the cap mid-rotation: if GRVT
+    // already has close to the cap of orders, skip activation this tick
+    // and let the next tick fill in after cancels settle.
+    const headroom = Math.max(0, M - (currentOpenOrders - virtualized));
+    const activateBudget = Math.min(MAX_OPS_PER_TICK, headroom);
+
+    for (const r of toActivate.slice(0, activateBudget)) {
+      try {
+        // Determine correct side based on current price (may differ from DB if stale)
+        const correctSide: 'buy' | 'sell' = r.level.price < currentPrice ? 'buy' : 'sell';
+        const qty = this.getFixedQty();
+        await db.updateGridLevel(r.level.id, {
+          state: 'active', order_id: '0x00', side: correctSide, quantity: qty, is_filled: false,
+        });
+        await this.placeGridOrder({ ...r.level, side: correctSide, quantity: qty, state: 'active' });
+        activated++;
+        log.info(`💫 Activated ${correctSide} @ $${r.level.price} (dist=$${r.dist.toFixed(2)})`);
+      } catch (e) {
+        log.warn({ err: (e as Error).message }, `activate fail @ $${r.level.price}`);
+        // Roll back to virtual so next tick retries cleanly
+        await db.updateGridLevel(r.level.id, { state: 'virtual', order_id: null });
+      }
+    }
+
+    if (virtualized > 0 || activated > 0) {
+      log.info(`🔄 Rotation: -${virtualized} virtualized, +${activated} activated`);
+    }
+  }
+
+  /**
    * Colocar orden en un nivel de grid
    * ⚠️ ACTUALIZADO: usar nuevo createOrder con validación min_notional
    */
   async placeGridOrder(level: GridLevel): Promise<void> {
     log.info(`📝 [DEBUG] placeGridOrder() INICIADO - Bot: ${this.bot.id}, Level: ${level.level_index}`);
     log.info(`📝 [DEBUG] placeGridOrder() - Orden: ${level.side} ${level.quantity} ${this.bot.pair} @ $${level.price}`);
-    
+
+    // Record placement time for GRVT-lag guard in monitor. Set BEFORE the
+    // async GRVT call so even if the call itself takes a while, subsequent
+    // monitor ticks see this level as recently-placed.
+    this.recentlyPlaced.set(level.id, Date.now());
+
     try {
       // ⚠️ VALIDAR MIN_NOTIONAL antes de colocar orden
       const notional = level.quantity * level.price;
       const { min_notional: minNotional } = getInstrumentSpec(this.bot.pair);
-      
+
       if (notional < minNotional) {
         log.info(`⚠️ [DEBUG] SKIP nivel ${level.level_index}: notional $${notional.toFixed(2)} < min_notional $${minNotional}`);
         return;
@@ -2248,6 +2566,17 @@ export class GridBotInstance {
    * ⚠️ FIX CRÍTICO: Verificar fills reales con fill_history antes de asumir fills
    */
   async monitor(): Promise<void> {
+    // H.8: skip monitoring while placeInitialOrders() is in flight. The
+    // bootstrap places orders with a 200ms throttle over ~15s; during that
+    // window GRVT's openOrders response lags behind what we've actually
+    // submitted, so the "uncovered" detection would re-place the same orders
+    // → duplicate orders on-exchange (seen on bot 46: 91-95 orders where 70
+    // were expected). Resuming monitoring once bootstrap has drained.
+    if (this.bootstrapInProgress) {
+      log.info(`⏳ Bot ${this.bot.id}: bootstrap in progress, skipping monitor tick`);
+      return;
+    }
+
     // 0. Refresh bot config from DB (picks up compound changes)
     const freshBot = await db.getBot(this.bot.id);
     if (freshBot) this.bot = freshBot;
@@ -2312,26 +2641,44 @@ export class GridBotInstance {
         side: leg.is_buying_asset ? 'buy' : 'sell'
       });
     }
-    
-    // 4. Get grid levels and sync DB with GRVT reality
+
+    // 4. Get grid levels and sync DB with GRVT reality.
+    // H.8: if virtual_enabled, only levels with state='active' are expected
+    // to have orders. state='virtual' levels are explicitly skipped from
+    // uncovered detection (they're expected to NOT have an order).
     const gridLevels = await db.getGridLevels(this.bot.id);
     const filledLevels: any[] = [];
     const uncoveredLevels: { level: any, price: number, dist: number }[] = [];
-    
+    const isVirtual = !!this.bot.virtual_enabled;
+
+    // Match tolerance: must be < gridStep/2, otherwise a single GRVT order
+    // can match two adjacent DB levels and the loser gets re-placed → duplicate.
+    // Real bug from bot 48 (SOL, step=0.25): old fixed 0.5 tolerance caused
+    // perpetual duplicate→kill cycles around the entry price.
+    const gridStep = (this.bot.upper_price - this.bot.lower_price) / this.bot.num_grids;
+    const matchTolerance = Math.min(0.05, gridStep / 3);
+
     for (const level of gridLevels) {
+      // H.8: skip virtual levels — they're supposed to have no order
+      if (isVirtual && level.state === 'virtual') continue;
+
       const lp = Math.round(level.price * 100) / 100;
-      
-      // Check if GRVT has an order at this price (±$0.5 to handle rounding)
+
+      // Check if GRVT has an order at this price. Tolerance must be tight
+      // enough that adjacent grid levels can never alias to the same order.
       let covered = false;
       for (const gp of grvtPriceSet) {
-        if (Math.abs(gp - lp) < 0.5) {
-          // Covered — sync DB with GRVT order_id
+        if (Math.abs(gp - lp) < matchTolerance) {
+          // Covered — sync DB with GRVT order_id and force state back to
+          // 'active' (a level with a live GRVT order is, by definition,
+          // active — clears stale 'filled'/'virtual' from earlier cycles).
           const grvtOrder = grvtOrderMap.get(gp);
           if (grvtOrder) {
             await db.updateGridLevel(level.id, {
               order_id: grvtOrder.order_id,
               side: grvtOrder.side,
-              is_filled: false
+              is_filled: false,
+              state: 'active'
             });
           }
           grvtPriceSet.delete(gp); // consume to prevent double-match
@@ -2339,8 +2686,15 @@ export class GridBotInstance {
           break;
         }
       }
-      
+
       if (!covered) {
+        // Level has no GRVT order matching. Two possibilities:
+        //   A) Order was just placed by rotation/bootstrap, GRVT lag → don't re-place
+        //   B) Order got filled (disappeared from openOrders) → need counter-order
+        // Both cases flow into uncoveredLevels; the downstream recentFills
+        // check distinguishes them. The fill path marks it filled; the lag
+        // path will be handled by placing (which is idempotent due to the
+        // DB order_id check in the place step below).
         uncoveredLevels.push({ level, price: lp, dist: Math.abs(lp - currentPrice) });
       }
     }
@@ -2360,38 +2714,60 @@ export class GridBotInstance {
     }
     
     if (uncoveredLevels.length > 1 && openOrders.length < 94) {
-      // Check fill_history ONCE for recent fills (last 90s)
+      // Check BOTH fill sources ONCE (REST + WS-backed archive).
+      // REST is slower but covers longer history; archive is fresher and
+      // can catch fills inside the 10s placement window where REST lags.
       const recentFills = await this.grvt.getFillHistory(50, this.bot.pair!);
+      const archivedFills = await db.findRecentFillsForBot(this.bot.id, 90_000);
       const now = Date.now();
-      
+
       for (let i = 1; i < uncoveredLevels.length; i++) {
         const uc = uncoveredLevels[i]!;
-        
-        // Check if this was a recent fill
+
+        // Check if this was a recent fill (REST)
         const fillMatch = recentFills.find((fill: any) => {
           const fp = parseFloat(fill.price);
           const ft = parseInt(fill.event_time || '0') / 1e6;
           return Math.abs(fp - uc.level.price) < 1.0 && (now - ft) < 90000;
         });
-        
-        if (fillMatch) {
-          const fillKey = `${(fillMatch as any).fill_id || (fillMatch as any).trade_id || `fill-${uc.price}-${now}`}`;
+
+        // Fallback: check local archive (WS-backed, fresher than REST).
+        // Critical for aggressive candles that fill a just-placed counter
+        // before REST getFillHistory catches up.
+        const archiveMatch = !fillMatch ? archivedFills.find(f =>
+          Math.abs(f.price - uc.level.price) < 1.0
+        ) : null;
+
+        if (fillMatch || archiveMatch) {
+          const source = fillMatch ? 'REST' : 'WS';
+          const fillKey = fillMatch
+            ? `${(fillMatch as any).fill_id || (fillMatch as any).trade_id || `fill-${uc.price}-${now}`}`
+            : archiveMatch!.fill_id;
           if (!this.processedFills.has(fillKey)) {
             this.processedFills.add(fillKey);
             if (this.processedFills.size > 200) {
               [...this.processedFills].slice(0, 100).forEach(e => this.processedFills.delete(e));
             }
-            log.info(`✅ Fill confirmed: ${uc.level.side} @ $${uc.level.price}`);
+            log.info(`✅ Fill confirmed (${source}): ${uc.level.side} @ $${uc.level.price}`);
             filledLevels.push(uc.level);
           }
           continue;
         }
-        
-        // Not a fill — re-place (only if GRVT count allows)
+
+        // Not a fill on EITHER source. GRVT-lag guard: if we placed this
+        // level very recently, both openOrders AND fill sources may still
+        // be catching up. Skip this tick to avoid re-placing over what
+        // might already be a live (or recently-filled) order.
+        const placedAt = this.recentlyPlaced.get(uc.level.id);
+        if (placedAt && Date.now() - placedAt < 10_000) {
+          log.info(`⏭️ Skip re-place @ $${uc.level.price}: placed ${((Date.now() - placedAt) / 1000).toFixed(1)}s ago (GRVT lag)`);
+          continue;
+        }
+
+        // Re-place (only if GRVT count allows)
         const correctSide: 'buy' | 'sell' = uc.price < currentPrice ? 'buy' : 'sell';
-        // Fixed qty: same for ALL levels (calculated from midpoint price)
         const newQty = this.getFixedQty();
-        log.info(`⚠️ Re-placing: ${correctSide} ${newQty} ETH @ $${uc.level.price}`);
+        log.info(`⚠️ Re-placing: ${correctSide} ${newQty} @ $${uc.level.price}`);
         try {
           await db.updateGridLevel(uc.level.id, { order_id: '0x00', is_filled: false, side: correctSide, quantity: newQty });
           uc.level.side = correctSide;
@@ -2404,9 +2780,30 @@ export class GridBotInstance {
       }
     }
     
-    // 5.5 DUPLICATE KILLER: if >93 orders, cancel extras
-    if (openOrders.length > 93) {
-      log.info(`🔴 ${openOrders.length} orders — killing duplicates`);
+    // 5.4 VIRTUAL GRID ROTATION (H.8): slide the active window to follow price.
+    // Runs before the duplicate killer so rotation-driven cancels aren't misread as duplicates.
+    if (isVirtual) {
+      await this.rotateVirtualWindow(currentPrice, openOrders.length);
+    }
+
+    // 5.5 DUPLICATE / ORPHAN KILLER
+    // Expected = levels that SHOULD have an order on GRVT right now:
+    //   - is_filled=0 (filled/gap levels don't carry orders)
+    //   - state != 'virtual' (virtuals are intentionally outside the window)
+    // If GRVT has more orders than that count, we have duplicates and/or orphans.
+    // Loose threshold (active_window_size) was tolerating real duplicates because
+    // it counted virtualized-but-not-cancelled stale orders as "expected".
+    const expectedActiveLevels = gridLevels.filter(l => {
+      if (l.is_filled) return false;
+      if (this.bot.virtual_enabled && l.state === 'virtual') return false;
+      return true;
+    });
+    const expectedMaxOrders = expectedActiveLevels.length;
+
+    if (openOrders.length > expectedMaxOrders) {
+      log.info(`🔴 ${openOrders.length} orders (expected ≤${expectedMaxOrders}) — killing dupes/orphans`);
+
+      // Step 1: kill exact duplicates (same price > 1 order). Keep first, cancel rest.
       const pc = new Map<string, any[]>();
       for (const order of openOrders) {
         const leg = (order as any).legs?.[0];
@@ -2415,14 +2812,30 @@ export class GridBotInstance {
         if (!pc.has(pk)) pc.set(pk, []);
         pc.get(pk)!.push(order);
       }
+      const survivors: any[] = [];
       for (const [price, ords] of pc) {
-        if (ords.length > 1) {
-          for (let i = 1; i < ords.length; i++) {
-            try {
-              await this.grvt.cancelOrder(ords[i].order_id, this.bot.pair);
-              log.info(`🗑️ Killed dupe @ $${price}`);
-            } catch (e) { /* ignore */ }
-          }
+        survivors.push(ords[0]);
+        for (let i = 1; i < ords.length; i++) {
+          try {
+            await this.grvt.cancelOrder(ords[i].order_id, this.bot.pair);
+            log.info(`🗑️ Killed dupe @ $${price}`);
+          } catch (e) { /* ignore */ }
+        }
+      }
+
+      // Step 2: kill orphans — survivors at prices that don't match any expected level.
+      // These are orders for levels that were virtualized or filled in DB but the
+      // cancel step on GRVT failed silently (or external orders).
+      const expectedPriceSet = new Set(expectedActiveLevels.map(l => l.price.toFixed(2)));
+      for (const order of survivors) {
+        const leg = (order as any).legs?.[0];
+        if (!leg?.limit_price) continue;
+        const pk = parseFloat(leg.limit_price).toFixed(2);
+        if (!expectedPriceSet.has(pk)) {
+          try {
+            await this.grvt.cancelOrder(order.order_id, this.bot.pair);
+            log.info(`🗑️ Killed orphan @ $${pk}`);
+          } catch (e) { /* ignore */ }
         }
       }
     }
@@ -2459,19 +2872,43 @@ export class GridBotInstance {
       
       // Fixed qty: same for ALL levels (calculated from midpoint price)
       const finalQty = this.getFixedQty();
-      
+
+      // H.8: if counter level is OUTSIDE the active window, don't place an order.
+      // Mark it 'virtual' so rotateVirtualWindow activates it when price approaches.
+      // Also mark the filled level as 'filled' state.
+      if (this.bot.virtual_enabled) {
+        const M = this.bot.active_window_size ?? 70;
+        // Compute the counter level's distance rank against all non-filled levels
+        const nonFilled = gridLevelsAll
+          .filter((l: any) => l.state !== 'filled' && l.id !== level.id)
+          .map((l: any) => ({ id: l.id, dist: Math.abs(l.price - currentPrice) }))
+          .sort((a: any, b: any) => a.dist - b.dist);
+        const insideWindow = nonFilled.slice(0, M).some((l: any) => l.id === counterLevel.id);
+
+        if (!insideWindow) {
+          log.info(`🌫️ Counter level ${counterLevelIndex} @ $${counterLevel.price} outside window — marking virtual`);
+          await db.updateGridLevel(counterLevel.id, {
+            side: counterSide, quantity: finalQty, state: 'virtual', order_id: null, is_filled: false,
+          });
+          await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
+          await new Promise(r => setTimeout(r, 200));
+          continue;
+        }
+      }
+
       log.info(`🔄 Round-trip: ${level.side} filled @ $${level.price} → placing ${counterSide} ${finalQty} ETH @ $${counterLevel.price} (level ${counterLevelIndex})`);
-      
+
       try {
         await this.placeGridOrder({ ...counterLevel, side: counterSide, quantity: finalQty });
-        
+
         // Mark filled level as filled (it stays empty - the gap)
-        await db.updateGridLevel(level.id, { is_filled: true });
-        
+        await db.updateGridLevel(level.id, { is_filled: true, state: 'filled' });
+
         // Update counter level with new side
         await db.updateGridLevel(counterLevel.id, {
           side: counterSide,
-          is_filled: false
+          is_filled: false,
+          state: 'active',
         });
       } catch (err: any) {
         if (err.message?.includes('7201') || err.message?.includes('2090')) {
@@ -2796,18 +3233,19 @@ export class GridBotInstance {
         avgEntryPrice = parseFloat(position.entry_price);
       }
 
-      // Recalcular grid profit desde fills_archive (FIFO spread matching).
-      // After the audit fix, fills_archive is the authoritative source:
-      // paired_roundtrips is regenerated from it and both should agree.
-      // The engine recalculates every 12th tick (~60s) to stay accurate
-      // as new fills arrive from the GRVT poller.
+      // Recalculate grid profit every 12th tick (~60s).
+      // Flow: calculateRealGridProfit() runs FIFO on fills_archive,
+      // persists new pairs to paired_roundtrips, then we read the
+      // canonical profit from paired_roundtrips (single source of truth).
       this.pnlUpdateCounter++;
       if (this.pnlUpdateCounter % 12 === 1) {
         try {
-          const realGridProfit = await this.calculateRealGridProfit();
-          if (realGridProfit !== null) {
-            this.bot.grid_profit_usdt = realGridProfit;
-          }
+          // 1) Run FIFO to discover & persist new pairs
+          await this.calculateRealGridProfit();
+          // 2) Read canonical profit from DB (gross - fees)
+          const gross = await db.sumPairedRoundtripProfit(this.bot.id);
+          const fees = await db.sumFeesForBot(this.bot.id);
+          this.bot.grid_profit_usdt = gross - fees;
         } catch (gpErr) {
           log.info(`⚠️ Error calculating grid profit: ${gpErr}`);
         }
@@ -2874,19 +3312,16 @@ export class GridBotInstance {
       let totalFees = 0;
       let grossProfit = 0;
       let pairs = 0;
-      const pendingBuys: Array<{ price: number; size: number }> = [];
+      const pendingBuys: Array<{ fill_id: string; price: number; size: number; event_time: string }> = [];
       let totalBuys = 0;
       let totalSells = 0;
 
       for (const f of fills) {
-        // fee is signed in fills_archive: negative = rebate earned. To
-        // compute *net* grid profit we want gross - |fees| − (−|rebates|)
-        // = gross + rebates - fees, which is gross - signedFees.
         totalFees += f.fee;
 
         if (f.is_buyer) {
           totalBuys++;
-          pendingBuys.push({ price: f.price, size: f.size });
+          pendingBuys.push({ fill_id: f.fill_id, price: f.price, size: f.size, event_time: f.event_time });
         } else {
           totalSells++;
           let bestIdx = -1;
@@ -2900,9 +3335,21 @@ export class GridBotInstance {
           });
           if (bestIdx >= 0) {
             const b = pendingBuys[bestIdx]!;
-            grossProfit += (f.price - b.price) * f.size;
+            const profit = (f.price - b.price) * f.size;
+            grossProfit += profit;
             pairs++;
             pendingBuys.splice(bestIdx, 1);
+            // Persist to paired_roundtrips (idempotent via INSERT OR IGNORE)
+            db.insertPairedRoundtrip({
+              bot_id: this.bot.id,
+              buy_fill_id: b.fill_id,
+              sell_fill_id: f.fill_id,
+              buy_price: b.price,
+              sell_price: f.price,
+              size: f.size,
+              profit,
+              created_at: f.event_time,
+            }).catch(() => {}); // fire-and-forget, idempotent
           }
         }
       }
@@ -2964,37 +3411,10 @@ export class GridBotInstance {
   }
 
   /**
-   * Configurar daily snapshots para ejecutar cada 24h a las 00:00 UTC
+   * Create daily snapshot for this bot instance. Called by GridEngine's
+   * runDailySnapshotsForAllBots() which handles scheduling.
    */
-  private setupDailySnapshots(): void {
-    // Take a snapshot on boot if there isn't one for today yet.
-    // This fixes the issue where repeated restarts reset the midnight
-    // timer and no snapshot ever gets created.
-    setTimeout(() => {
-      this.createDailySnapshots().catch(err => log.error({ err: (err as Error).message }, 'async task failed'));
-    }, 10_000); // 10s after boot (let auth + first monitor pass complete)
-
-    // Schedule next at midnight UTC, then every 24h
-    const now = new Date();
-    const tomorrow = new Date(now);
-    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
-    tomorrow.setUTCHours(0, 0, 0, 0);
-    const msUntilMidnight = tomorrow.getTime() - now.getTime();
-
-    log.info(`📸 Daily snapshots: boot snapshot in 10s, then midnight UTC (${Math.round(msUntilMidnight / 1000 / 3600)}h)`);
-
-    setTimeout(() => {
-      this.createDailySnapshots().catch(err => log.error({ err: (err as Error).message }, 'async task failed'));
-      (this as any).dailySnapshotInterval = setInterval(() => {
-        this.createDailySnapshots().catch(err => log.error({ err: (err as Error).message }, 'async task failed'));
-      }, 24 * 60 * 60 * 1000);
-    }, msUntilMidnight);
-  }
-
-  /**
-   * Crear snapshots diarios para todos los bots activos
-   */
-  private async createDailySnapshots(): Promise<void> {
+  async createDailySnapshots(): Promise<void> {
     try {
       const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
       log.info(`📸 Creando daily snapshots para ${today}...`);
@@ -3022,20 +3442,17 @@ export class GridBotInstance {
             return;
           }
           
-          // Obtener balance actual
-          const balance = await this.grvt.getBalance();
-          const equity = parseFloat(balance.total_equity || '0');
+          // Bot equity = investment + total PnL (not account-wide balance)
+          const freshBot = await db.getBot(botId);
+          const botInvestment = freshBot?.investment_usdt ?? 0;
+          const botTotalPnl = freshBot?.total_pnl_usdt ?? 0;
+          const equity = botInvestment + botTotalPnl;
           
-          // Calcular grid profit net
-          const gridProfitNet = await this.calculateRealGridProfit() || 0;
-
-          // Contar round-trips desde paired_roundtrips (source of truth real).
-          // FIX 2026-04-07: el código previo contaba sells en la tabla `trades`,
-          // que dejó de actualizarse cuando el monitor() refactorizó a no usar
-          // handleOrderFilled. Eso causó que num_round_trips quedara congelado.
-          // paired_roundtrips se llena correctamente desde calculateRealGridProfit
-          // y es la fuente de verdad real.
-          const roundTrips = await db.countPairedRoundtrips();
+          // Grid profit from paired_roundtrips (single source of truth)
+          const gross = await db.sumPairedRoundtripProfit(botId);
+          const fees = await db.sumFeesForBot(botId);
+          const gridProfitNet = gross - fees;
+          const roundTrips = await db.countPairedRoundtrips(botId);
           
           // Crear snapshot
           await db.createDailySnapshot({

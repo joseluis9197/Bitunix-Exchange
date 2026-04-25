@@ -69,6 +69,9 @@ export interface GridBot {
   dca_amount_usdt?: number | null;
   dca_interval_hours?: number | null;
   last_dca_at?: string | null;
+  // H.8: Virtual grids
+  virtual_enabled?: number;
+  active_window_size?: number | null;
 }
 
 export interface GridLevel {
@@ -80,9 +83,13 @@ export interface GridLevel {
   quantity: number;
   is_filled: boolean;
   pending_replace?: boolean;
-  order_id?: string;
+  // Nullable to allow explicit null in updates (used to clear order_id when virtualizing).
+  order_id?: string | null;
   filled_at?: string;
   created_at: string;
+  // H.8: Virtual grids state. 'active' = order on exchange, 'virtual' = outside window,
+  // 'filled' = executed (mirrors is_filled for legacy). Default 'active' for legacy rows.
+  state?: 'active' | 'virtual' | 'filled';
 }
 
 export interface OrderRecord {
@@ -359,9 +366,18 @@ export class GridBotDB {
       'dca_amount_usdt REAL',
       'dca_interval_hours REAL',
       'last_dca_at TEXT',
+      // H.8: Virtual grids — allow grid counts beyond GRVT's 80 order cap
+      // by keeping only the N closest to market active; rotate as price moves.
+      'virtual_enabled INTEGER DEFAULT 0',
+      'active_window_size INTEGER',
     ]) {
       try { await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN ${col}`); } catch (e) { /* exists */ }
     }
+
+    // H.8: Add `state` column to grid_levels ('active' | 'virtual' | 'filled')
+    try { await this.dbRun(`ALTER TABLE grid_levels ADD COLUMN state TEXT DEFAULT 'active'`); } catch (e) { /* exists */ }
+    // Backfill: filled legacy rows (is_filled=1) should have state='filled'
+    try { await this.dbRun(`UPDATE grid_levels SET state = 'filled' WHERE is_filled = 1 AND (state IS NULL OR state = 'active')`); } catch (e) { /* */ }
 
     // Tabla: bot_cash_movements — explicit ledger for every cash flow
     // touching a bot's notional. Each row records WHY investment_usdt
@@ -455,6 +471,31 @@ export class GridBotDB {
       )
     `);
 
+    // Migrate legacy daily_snapshots schema: old table had (timestamp,
+    // balance_usdt, grid_profit_usdt, total_pnl_usdt, equity_usdt) but new
+    // code expects (date, equity, grid_profit_net, trend_pnl, total_pnl).
+    // Add the missing columns and backfill from old columns.
+    for (const col of [
+      'date TEXT',
+      'equity REAL DEFAULT 0',
+      'grid_profit_net REAL DEFAULT 0',
+      'trend_pnl REAL DEFAULT 0',
+      'total_pnl REAL DEFAULT 0',
+      'round_trips INTEGER DEFAULT 0',
+      'eth_price REAL',
+    ]) {
+      try { await this.dbRun(`ALTER TABLE daily_snapshots ADD COLUMN ${col}`); } catch (e) { /* exists */ }
+    }
+    // Backfill: copy old columns → new columns where new ones are still NULL/0
+    try {
+      await this.dbRun(`UPDATE daily_snapshots SET date = substr(timestamp, 1, 10) WHERE date IS NULL AND timestamp IS NOT NULL`);
+      await this.dbRun(`UPDATE daily_snapshots SET equity = equity_usdt WHERE equity = 0 AND equity_usdt IS NOT NULL AND equity_usdt > 0`);
+      await this.dbRun(`UPDATE daily_snapshots SET grid_profit_net = grid_profit_usdt WHERE grid_profit_net = 0 AND grid_profit_usdt IS NOT NULL AND grid_profit_usdt != 0`);
+      await this.dbRun(`UPDATE daily_snapshots SET total_pnl = total_pnl_usdt WHERE total_pnl = 0 AND total_pnl_usdt IS NOT NULL AND total_pnl_usdt != 0`);
+      await this.dbRun(`UPDATE daily_snapshots SET trend_pnl = trend_pnl_usdt WHERE trend_pnl = 0 AND trend_pnl_usdt IS NOT NULL AND trend_pnl_usdt != 0`);
+      await this.dbRun(`UPDATE daily_snapshots SET round_trips = num_round_trips WHERE round_trips = 0 AND num_round_trips IS NOT NULL AND num_round_trips > 0`);
+    } catch (e) { /* old columns may not exist on fresh DBs */ }
+
     // Tabla: fills_archive — every GRVT fill we've ever observed for this
     // sub-account, attributed to a bot via (bot_id, instrument).
     // Originally created ad-hoc by an emergency script (no bot_id, global).
@@ -526,6 +567,17 @@ export class GridBotDB {
       )
     `);
 
+    // Migration: add bot_id to paired_roundtrips (was missing in original schema)
+    try { await this.dbRun(`ALTER TABLE paired_roundtrips ADD COLUMN bot_id INTEGER REFERENCES grid_bots(id)`); } catch (e) { /* exists */ }
+    // Backfill: assign bot_id to orphan rows by joining on buy_fill_id → fills_archive.bot_id
+    try {
+      await this.dbRun(`
+        UPDATE paired_roundtrips SET bot_id = (
+          SELECT fa.bot_id FROM fills_archive fa WHERE fa.fill_id = paired_roundtrips.buy_fill_id LIMIT 1
+        ) WHERE bot_id IS NULL
+      `);
+    } catch (e) { /* fills_archive may not exist yet on fresh DBs */ }
+
     // Índices para performance
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_bots_status ON grid_bots(status)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_grid_levels_bot_id ON grid_levels(bot_id)`);
@@ -533,6 +585,7 @@ export class GridBotDB {
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_trades_bot_id ON trades(bot_id)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_funding_bot_id ON funding_history(bot_id)`);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_paired_roundtrips_bot ON paired_roundtrips(bot_id)`);
 
     // ─── Multi-tenancy migration ────────────────────────────────────
     // Adds users + grvt_credentials + terms_acceptances + user_id on
@@ -696,6 +749,7 @@ export class GridBotDB {
       { table: 'daily_snapshots',    parentJoin: 'NEW.bot_id' },
       { table: 'bot_cash_movements', parentJoin: 'NEW.bot_id' },
       { table: 'fills_archive',      parentJoin: 'NEW.bot_id' },
+      { table: 'paired_roundtrips', parentJoin: 'NEW.bot_id' },
     ];
     for (const { table, parentJoin } of childTables) {
       const triggerName = `trg_${table}_user_id`;
@@ -762,7 +816,9 @@ export class GridBotDB {
       quantityPerLevel,        // immutable per-level qty
       params.grid_profit_usdt, params.trend_pnl_usdt, params.total_pnl_usdt,
       params.status, params.position_size, params.avg_entry_price,
-      params.liquidation_price, params.params_json
+      params.liquidation_price, params.params_json,
+      params.virtual_enabled ?? 0,
+      params.active_window_size ?? null,
     ];
     const sql = `
       INSERT INTO grid_bots (
@@ -770,8 +826,9 @@ export class GridBotDB {
         pair, direction, leverage, lower_price, upper_price, num_grids,
         investment_usdt, original_investment_usdt, quantity_per_level,
         grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
-        status, position_size, avg_entry_price, liquidation_price, params_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, position_size, avg_entry_price, liquidation_price, params_json,
+        virtual_enabled, active_window_size
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     await this.dbRun(sql, values);
@@ -896,11 +953,12 @@ export class GridBotDB {
    * Crear nivel de grid
    */
   async createGridLevel(params: Omit<GridLevel, 'id' | 'created_at'>): Promise<number> {
-    const values = [params.bot_id, params.level_index, params.price, params.side, 
-        params.quantity, params.is_filled ? 1 : 0, params.order_id || null, params.filled_at || null];
-    const sql = `INSERT INTO grid_levels (bot_id, level_index, price, side, quantity, is_filled, order_id, filled_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
-    
+    const state = params.state ?? 'active';
+    const values = [params.bot_id, params.level_index, params.price, params.side,
+        params.quantity, params.is_filled ? 1 : 0, params.order_id || null, params.filled_at || null, state];
+    const sql = `INSERT INTO grid_levels (bot_id, level_index, price, side, quantity, is_filled, order_id, filled_at, state)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
     await this.dbRun(sql, values);
     const row = await this.dbGet('SELECT last_insert_rowid() as id');
     return row.id;
@@ -975,10 +1033,10 @@ export class GridBotDB {
   /**
    * Actualizar campos de un grid level
    */
-  async updateGridLevel(levelId: number, updates: Partial<Pick<GridLevel, 'side' | 'is_filled' | 'order_id' | 'pending_replace' | 'quantity'>>): Promise<void> {
+  async updateGridLevel(levelId: number, updates: Partial<Pick<GridLevel, 'side' | 'is_filled' | 'order_id' | 'pending_replace' | 'quantity' | 'state'>>): Promise<void> {
     const fields: string[] = [];
     const values: any[] = [];
-    
+
     if (updates.side !== undefined) {
       fields.push('side = ?');
       values.push(updates.side);
@@ -989,7 +1047,8 @@ export class GridBotDB {
     }
     if (updates.order_id !== undefined) {
       fields.push('order_id = ?');
-      values.push(updates.order_id);
+      // Accept explicit null to clear order_id (used when virtualizing)
+      values.push(updates.order_id === null ? null : updates.order_id);
     }
     if (updates.pending_replace !== undefined) {
       fields.push('pending_replace = ?');
@@ -998,6 +1057,10 @@ export class GridBotDB {
     if (updates.quantity !== undefined) {
       fields.push('quantity = ?');
       values.push(updates.quantity);
+    }
+    if (updates.state !== undefined) {
+      fields.push('state = ?');
+      values.push(updates.state);
     }
     
     if (fields.length === 0) return; // No updates
@@ -1041,6 +1104,7 @@ export class GridBotDB {
       price: number;
       side: 'buy' | 'sell';
       quantity: number;
+      state?: 'active' | 'virtual' | 'filled';
     }>
   ): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -1061,10 +1125,11 @@ export class GridBotDB {
           }
           let failed = false;
           for (const level of newLevels) {
+            const st = level.state ?? 'active';
             this.db.run(
-              `INSERT INTO grid_levels (bot_id, level_index, price, side, quantity, is_filled, order_id)
-               VALUES (?, ?, ?, ?, ?, 0, '0x00')`,
-              [botId, level.level_index, level.price, level.side, level.quantity],
+              `INSERT INTO grid_levels (bot_id, level_index, price, side, quantity, is_filled, order_id, state)
+               VALUES (?, ?, ?, ?, ?, 0, '0x00', ?)`,
+              [botId, level.level_index, level.price, level.side, level.quantity, st],
               (insErr) => {
                 if (failed) return;
                 if (insErr) {
@@ -1208,19 +1273,22 @@ export class GridBotDB {
    * Crear snapshot diario
    */
   async createDailySnapshot(params: Omit<DailySnapshot, 'id' | 'created_at'>): Promise<number> {
+    const ts = new Date(params.date + 'T00:00:00Z').toISOString();
     const result = await this.dbRun(`
-      INSERT OR REPLACE INTO daily_snapshots 
-      (bot_id, date, equity, grid_profit_net, trend_pnl, total_pnl, round_trips, eth_price)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO daily_snapshots
+      (bot_id, date, timestamp, equity, balance_usdt, equity_usdt,
+       grid_profit_net, grid_profit_usdt, trend_pnl, trend_pnl_usdt,
+       total_pnl, total_pnl_usdt, round_trips, num_round_trips,
+       eth_price, position_size, drawdown_pct)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
     `, [
-      params.bot_id, 
-      params.date, 
-      params.equity, 
-      params.grid_profit_net, 
-      params.trend_pnl, 
-      params.total_pnl, 
-      params.round_trips, 
-      params.eth_price
+      params.bot_id, params.date, ts,
+      params.equity, params.equity, params.equity,
+      params.grid_profit_net, params.grid_profit_net,
+      params.trend_pnl, params.trend_pnl,
+      params.total_pnl, params.total_pnl,
+      params.round_trips, params.round_trips,
+      params.eth_price,
     ]);
 
     return result.lastID!;
@@ -1373,6 +1441,7 @@ export class GridBotDB {
    * missing on 2026-04-08 (inherited bot 42's $76 profit).
    */
   async getFillsForBot(botId: number): Promise<Array<{
+    fill_id: string;
     is_buyer: number;
     price: number;
     size: number;
@@ -1380,11 +1449,37 @@ export class GridBotDB {
     event_time: string;
   }>> {
     return this.dbAll(`
-      SELECT is_buyer, price, size, fee, event_time
+      SELECT fill_id, is_buyer, price, size, fee, event_time
       FROM fills_archive
       WHERE bot_id = ?
       ORDER BY event_time ASC
     `, [botId]);
+  }
+
+  /**
+   * Recent fills for a bot within a time window (ms). Used by the monitor
+   * loop to detect fills via the WebSocket-backed archive *before* the
+   * GRVT-lag skip kicks in. WS is typically faster than REST
+   * getFillHistory, so this catches fills that happen inside the 10s
+   * placement window (aggressive candles sweeping through a level we
+   * just placed a counter on).
+   */
+  async findRecentFillsForBot(botId: number, withinMs: number): Promise<Array<{
+    fill_id: string;
+    event_time: string;
+    is_buyer: number;
+    price: number;
+    size: number;
+  }>> {
+    const cutoffNs = ((Date.now() - withinMs) * 1_000_000).toString();
+    return this.dbAll(`
+      SELECT fill_id, event_time, is_buyer, price, size
+      FROM fills_archive
+      WHERE bot_id = ?
+        AND event_time > ?
+      ORDER BY event_time DESC
+      LIMIT 50
+    `, [botId, cutoffNs]);
   }
 
   /**
@@ -1509,6 +1604,7 @@ export class GridBotDB {
    * unique constraint.
    */
   async insertPairedRoundtrip(params: {
+    bot_id: number;
     buy_fill_id: string;
     sell_fill_id: string;
     buy_price: number;
@@ -1519,9 +1615,10 @@ export class GridBotDB {
   }): Promise<boolean> {
     const result = await this.dbRun(`
       INSERT OR IGNORE INTO paired_roundtrips
-        (buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+        (bot_id, buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `, [
+      params.bot_id,
       params.buy_fill_id,
       params.sell_fill_id,
       params.buy_price,
@@ -1533,40 +1630,25 @@ export class GridBotDB {
     return (result.changes ?? 0) > 0;
   }
 
-  /**
-   * Contar round-trips emparejados (source of truth real para num_round_trips).
-   * NOTE: la tabla paired_roundtrips no tiene bot_id (es global). Cuando
-   * Phase B introduzca multi-bot habrá que migrar esta tabla a tener bot_id.
-   */
-  async countPairedRoundtrips(): Promise<number> {
-    const row = await this.dbGet(`SELECT COUNT(*) as c FROM paired_roundtrips`);
+  /** Count paired roundtrips for a specific bot. */
+  async countPairedRoundtrips(botId: number): Promise<number> {
+    const row = await this.dbGet(
+      `SELECT COUNT(*) as c FROM paired_roundtrips WHERE bot_id = ?`, [botId]);
     return row?.c || 0;
   }
 
-  /**
-   * Sum total profit from all paired round-trips
-   */
-  async sumPairedRoundtripProfit(): Promise<number> {
-    const row = await this.dbGet(`SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips`);
+  /** Sum gross profit from paired roundtrips for a specific bot. */
+  async sumPairedRoundtripProfit(botId: number): Promise<number> {
+    const row = await this.dbGet(
+      `SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips WHERE bot_id = ?`, [botId]);
     return row?.p || 0;
   }
 
-  /**
-   * Sum roundtrip profit for a specific bot. paired_roundtrips doesn't
-   * have bot_id, but when user_id is set (multi-tenant) we use that.
-   * For the legacy single-bot case (no user_id), returns the global sum.
-   */
-  async getRoundtripProfitSum(botId: number): Promise<number | null> {
-    const bot = await this.getBot(botId);
-    if (!bot) return null;
-    // If we have user_id, scope by it. Otherwise global sum.
-    const row = bot.user_id
-      ? await this.dbGet(
-          `SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips WHERE COALESCE(user_id, 1) = ?`,
-          [bot.user_id]
-        )
-      : await this.dbGet(`SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips`);
-    return row?.p ?? null;
+  /** Sum fees from fills_archive for a specific bot. */
+  async sumFeesForBot(botId: number): Promise<number> {
+    const row = await this.dbGet(
+      `SELECT COALESCE(SUM(fee), 0) as f FROM fills_archive WHERE bot_id = ?`, [botId]);
+    return row?.f || 0;
   }
 
   /**

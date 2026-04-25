@@ -49,6 +49,8 @@ interface EngineOps {
     upperPrice: number;
     numGrids: number;
     investmentUSDT: number;
+    virtualEnabled?: boolean;
+    activeWindowSize?: number;
   }): Promise<number>;
   startBot(botId: number): Promise<void>;
   pauseBot(botId: number): Promise<void>;

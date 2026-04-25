@@ -35,6 +35,9 @@ export function RangePickerChart({
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  // Track created price line handles explicitly — LWC doesn't expose a reliable
+  // "list all lines" API, so we own the lifecycle here.
+  const priceLinesRef = useRef<Array<ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']>>>([]);
   const [dragging, setDragging] = useState<'lower' | 'upper' | null>(null);
 
   const candlesQuery = useQuery({
@@ -114,32 +117,35 @@ export function RangePickerChart({
     const series = seriesRef.current;
     if (!series) return;
 
-    // Remove existing price lines and recreate
-    // (LWC doesn't expose updateOptions on all versions)
-    const existingLines = (series as any)._priceLines ?? [];
-    for (const line of [...existingLines]) {
+    // Remove previously-created lines via their tracked handles
+    for (const line of priceLinesRef.current) {
       try { series.removePriceLine(line); } catch { /* noop */ }
     }
+    priceLinesRef.current = [];
 
     if (lower > 0) {
-      series.createPriceLine({
-        price: lower,
-        color: '#3b82f6',
-        lineWidth: 2,
-        lineStyle: 2, // dashed
-        axisLabelVisible: true,
-        title: 'Lower',
-      });
+      priceLinesRef.current.push(
+        series.createPriceLine({
+          price: lower,
+          color: '#3b82f6',
+          lineWidth: 2,
+          lineStyle: 2, // dashed
+          axisLabelVisible: true,
+          title: 'Lower',
+        })
+      );
     }
     if (upper > 0) {
-      series.createPriceLine({
-        price: upper,
-        color: '#8b5cf6',
-        lineWidth: 2,
-        lineStyle: 2,
-        axisLabelVisible: true,
-        title: 'Upper',
-      });
+      priceLinesRef.current.push(
+        series.createPriceLine({
+          price: upper,
+          color: '#8b5cf6',
+          lineWidth: 2,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title: 'Upper',
+        })
+      );
     }
   }, [lower, upper]);
 

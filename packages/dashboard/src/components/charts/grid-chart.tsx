@@ -62,6 +62,10 @@ const COLORS = {
   entry: '#A78BFA',
   liquidation: '#EF4444',
   flash: '#F8FAFC',
+  // H.8 virtual grids: muted gray-blue, dotted, so they read as "out of
+  // window — placeholder, no live order on exchange".
+  virtualBuy: '#1E3A2A',
+  virtualSell: '#3A1E1E',
 };
 
 const FLASH_DURATION_MS = 600;
@@ -294,12 +298,14 @@ export function GridChart({
   // Build a screen-reader summary of the chart state. Lightweight Charts
   // renders to a canvas which is opaque to assistive tech, so we expose
   // the key facts as an aria-label.
-  const buyCount = levels.filter((l) => l.side === 'buy' && l.is_filled === 0).length;
-  const sellCount = levels.filter((l) => l.side === 'sell' && l.is_filled === 0).length;
+  const activeBuy = levels.filter((l) => l.side === 'buy' && l.is_filled === 0 && l.state !== 'virtual').length;
+  const activeSell = levels.filter((l) => l.side === 'sell' && l.is_filled === 0 && l.state !== 'virtual').length;
+  const virtualCount = levels.filter((l) => l.state === 'virtual').length;
   const filledCount = levels.filter((l) => l.is_filled === 1).length;
+  const virtualSegment = virtualCount > 0 ? `, ${virtualCount} virtual` : '';
   const ariaLabel =
     `Grid chart with ${candles.length} candles. ` +
-    `${levels.length} levels: ${buyCount} active buys, ${sellCount} active sells, ${filledCount} filled. ` +
+    `${levels.length} levels: ${activeBuy} active buys, ${activeSell} active sells, ${filledCount} filled${virtualSegment}. ` +
     (markPrice ? `Mark price ${markPrice.toFixed(2)}. ` : '') +
     (entryPrice ? `Entry price ${entryPrice.toFixed(2)}.` : '');
 
@@ -319,11 +325,12 @@ export function GridChart({
 function priceLineOptionsFor(level: GridLevel, flash: boolean): PriceLineOptions {
   const isFilled = level.is_filled === 1;
   const isPending = level.pending_replace === 1;
+  const isVirtual = level.state === 'virtual';
 
   let color: string;
   let lineStyle = 0; // solid
   let lineWidth = 1;
-  let title = '';
+  const title = '';
 
   if (flash) {
     color = COLORS.flash;
@@ -334,6 +341,12 @@ function priceLineOptionsFor(level: GridLevel, flash: boolean): PriceLineOptions
   } else if (isFilled) {
     color = COLORS.filled;
     lineStyle = 2; // dashed for filled gap
+  } else if (isVirtual) {
+    // Virtual levels: muted variant of buy/sell color, dotted line — read
+    // as "scheduled but not on exchange yet, will activate when window
+    // rotates here".
+    color = level.side === 'buy' ? COLORS.virtualBuy : COLORS.virtualSell;
+    lineStyle = 3; // dotted (LWC: 0=solid, 1=dotted, 2=dashed, 3=large-dashed, 4=sparse-dotted)
   } else if (level.side === 'buy') {
     color = COLORS.buy;
   } else {

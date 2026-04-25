@@ -208,8 +208,8 @@ export class WsDispatcher {
 
   private broadcastNewFills(): Promise<void> {
     return new Promise((resolve) => {
-      this.db.all<PairedRoundtripRow>(
-        `SELECT id, buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at
+      this.db.all<PairedRoundtripRow & { bot_id: number | null }>(
+        `SELECT id, bot_id, buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at
          FROM paired_roundtrips
          WHERE id > ?
          ORDER BY id ASC`,
@@ -222,13 +222,9 @@ export class WsDispatcher {
           if (!rows || rows.length === 0) return resolve();
 
           for (const rt of rows) {
-            // Roundtrips don't carry a bot_id today (the schema is global —
-            // see the open question in DESIGN_LANGUAGE / project_grvt_grid_bot
-            // memory). For the v0 we publish to a global `fills` channel and
-            // also to bot:1 since there's only one bot. When we add bot_id
-            // to the schema in B.x, this gets a per-bot fanout.
             const fill = {
               id: rt.id,
+              botId: rt.bot_id,
               buyFillId: rt.buy_fill_id,
               sellFillId: rt.sell_fill_id,
               buyPrice: rt.buy_price,
@@ -238,7 +234,7 @@ export class WsDispatcher {
               createdAt: rt.created_at
             };
             wsBus.publish('fills', 'fill', fill);
-            wsBus.publish('bot:42', 'fill', fill);  // hard-coded for v0 — only bot 42 exists
+            if (rt.bot_id) wsBus.publish(`bot:${rt.bot_id}`, 'fill', fill);
             this.lastBroadcastRoundtripId = rt.id;
           }
           log.debug({ count: rows.length, lastId: this.lastBroadcastRoundtripId }, 'broadcast new fills');

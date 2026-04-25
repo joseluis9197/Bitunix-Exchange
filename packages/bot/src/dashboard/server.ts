@@ -108,12 +108,17 @@ async function initializeServices() {
 
 // Basic auth middleware
 const basicAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-  // Skip basic auth for the v2 surface — it has its own X-Api-Key auth via
-  // the v2 router middleware. Without this skip, the global basicAuth would
-  // 401 every v2 request before the router got a chance to see it.
-  // The /ws upgrade path doesn't go through Express middleware at all (the
-  // ws library handles it on its own), so no skip is needed there.
-  if (req.path.startsWith('/api/v2/')) {
+  // Skip basic auth for the v2 surface — it has its own X-Api-Key / JWT
+  // auth via the v2 router middleware. Without this skip, the global
+  // basicAuth would 401 every v2 request before the router got a chance
+  // to see it. The /ws upgrade path doesn't go through Express middleware
+  // at all (the ws library handles it on its own), so no skip is needed
+  // there.
+  // Also skip for the v2 React SPA at /dashboard — the SPA itself is
+  // public, the actual auth happens via JWT login inside the app
+  // (POST /api/v2/auth/login). Basic auth here is just a duplicate
+  // gate that confuses users.
+  if (req.path === '/' || req.path.startsWith('/api/v2/') || req.path.startsWith('/dashboard')) {
     return next();
   }
 
@@ -1044,7 +1049,14 @@ app.use(express.static(publicPath));
 console.log(`📁 Serving static files from: ${publicPath}`);
 
 // === MAIN DASHBOARD PAGE ===
+// Redirect bare host to the v2 SPA so users land directly on the JWT
+// login instead of the legacy basic-auth gate.
 app.get('/', (req, res) => {
+  res.redirect('/dashboard/');
+});
+
+// Legacy dashboard kept reachable for compatibility but moved off the root.
+app.get('/legacy', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 

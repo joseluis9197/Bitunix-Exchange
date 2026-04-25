@@ -10,7 +10,7 @@
 // Why paused-by-default: the engine's startBot() places real orders on
 // GRVT. We don't want a misclick on "Create" to immediately spend money.
 
-import { useState, type ReactNode } from 'react';
+import { useState, useMemo, type ReactNode } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -53,16 +53,18 @@ interface WizardState {
   tpPct: string;
   autoShiftEnabled: boolean;
   autoShiftPct: string;
+  virtualEnabled: boolean;
+  activeWindowSize: string;
 }
 
 const INITIAL_STATE: WizardState = {
-  pair: 'ETH_USDT_Perp',
+  pair: '',
   direction: 'long',
-  lower: '1800',
-  upper: '2450',
-  grids: '93',
-  investment: '1085',
-  leverage: '10',
+  lower: '',
+  upper: '',
+  grids: '',
+  investment: '',
+  leverage: '',
   acceptedRisk: false,
   compoundPct: '0',
   safeguardEnabled: false,
@@ -72,6 +74,8 @@ const INITIAL_STATE: WizardState = {
   tpPct: '',
   autoShiftEnabled: false,
   autoShiftPct: '10',
+  virtualEnabled: false,
+  activeWindowSize: '70',
 };
 
 // H.1: hardcoded fallback — used while the API query is loading
@@ -159,6 +163,13 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
     const autoShiftPayload = state.autoShiftEnabled
       ? { auto_shift_enabled: true, auto_shift_pct: parseFloat(state.autoShiftPct || '10') }
       : {};
+    // H.8: virtual grids
+    const virtualPayload = state.virtualEnabled
+      ? {
+          virtual_enabled: true,
+          active_window_size: Math.min(80, Math.max(20, parseInt(state.activeWindowSize || '70', 10))),
+        }
+      : {};
     createMutation.mutate({
       pair: validated.pair,
       direction: validated.direction,
@@ -172,6 +183,7 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
       ...(slPct > 0 ? { sl_pct: slPct } : {}),
       ...(tpPct > 0 ? { tp_pct: tpPct } : {}),
       ...autoShiftPayload,
+      ...virtualPayload,
     } as any);
   }
 
@@ -207,7 +219,13 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
         num_grids: parseInt(state.grids, 10),
         investment_usdt: parseFloat(state.investment),
         leverage: parseInt(state.leverage, 10),
-      };
+        ...(state.virtualEnabled
+          ? {
+              virtual_enabled: true,
+              active_window_size: parseInt(state.activeWindowSize || '70', 10),
+            }
+          : {}),
+      } as ValidateBotInput;
       validateMutation.mutate(input);
     }
     setStep((s) => Math.min(3, s + 1) as Step);
@@ -228,7 +246,14 @@ export function CreateBotWizard({ open, onClose }: CreateBotWizardProps) {
       const inv = parseFloat(state.investment);
       const grids = parseInt(state.grids, 10);
       const lev = parseInt(state.leverage, 10);
-      return inv > 0 && grids >= 2 && grids <= 95 && lev >= 1 && lev <= 50;
+      const maxGrids = state.virtualEnabled ? 500 : 95;
+      const windowOk =
+        !state.virtualEnabled ||
+        (() => {
+          const w = parseInt(state.activeWindowSize || '0', 10);
+          return w >= 20 && w <= 80;
+        })();
+      return inv > 0 && grids >= 2 && grids <= maxGrids && lev >= 1 && lev <= 50 && windowOk;
     }
     if (step === 3) return state.acceptedRisk;
     return false;
@@ -338,36 +363,60 @@ function StepPair({
   update: <K extends keyof WizardState>(k: K, v: WizardState[K]) => void;
   pairs: Array<{ value: string; label: string }>;
 }) {
+  const [query, setQuery] = useState('');
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return pairs;
+    return pairs.filter(
+      (p) =>
+        p.label.toLowerCase().includes(q) || p.value.toLowerCase().includes(q)
+    );
+  }, [pairs, query]);
+
   return (
     <div>
       <h3 className="text-sm font-semibold text-text-primary mb-3">
         Select instrument
       </h3>
-      <div className="grid grid-cols-2 gap-3">
-        {pairs.map((p) => {
-          const selected = state.pair === p.value;
-          return (
-            <button
-              key={p.value}
-              type="button"
-              onClick={() => update('pair', p.value)}
-              className={cn(
-                'p-4 rounded-md border text-left transition-colors',
-                selected
-                  ? 'border-primary bg-primary-soft text-text-primary'
-                  : 'border-border-subtle bg-bg-surface hover:border-border-default'
-              )}
-            >
-              <div className="font-semibold text-sm">{p.label}</div>
-              <div className="text-2xs text-text-muted mt-1">
-                Min size 0.001 · Max leverage 50x
-              </div>
-            </button>
-          );
-        })}
+      <Input
+        placeholder={`Search ${pairs.length} pairs (e.g. SOL, DOGE, BTC)`}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        className="mb-3"
+        autoFocus
+      />
+      <div className="max-h-[400px] overflow-y-auto pr-1">
+        <div className="grid grid-cols-2 gap-3">
+          {filtered.map((p) => {
+            const selected = state.pair === p.value;
+            return (
+              <button
+                key={p.value}
+                type="button"
+                onClick={() => update('pair', p.value)}
+                className={cn(
+                  'p-4 rounded-md border text-left transition-colors',
+                  selected
+                    ? 'border-primary bg-primary-soft text-text-primary'
+                    : 'border-border-subtle bg-bg-surface hover:border-border-default'
+                )}
+              >
+                <div className="font-semibold text-sm">{p.label}</div>
+                <div className="text-2xs text-text-muted mt-1">
+                  Min size 0.001 · Max leverage 50x
+                </div>
+              </button>
+            );
+          })}
+        </div>
+        {filtered.length === 0 && (
+          <p className="text-sm text-text-muted text-center py-8">
+            No pairs match "{query}"
+          </p>
+        )}
       </div>
       <p className="mt-4 text-2xs text-text-muted">
-        ⓘ More pairs coming. ETH and BTC perp are supported in v0.
+        {filtered.length} of {pairs.length} pairs shown
       </p>
 
       <div className="mt-6">
@@ -497,8 +546,42 @@ function StepConfig({
           inputMode="numeric"
           value={state.grids}
           onChange={(e) => update('grids', e.target.value)}
-          helper="2 – 95"
+          helper={state.virtualEnabled ? '2 – 500 (virtual)' : '2 – 95'}
         />
+      </div>
+
+      {/* H.8: Virtual grids */}
+      <div className="mt-4 rounded-md border border-border-subtle bg-bg-muted/40 p-4">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5 size-4 accent-primary"
+            checked={state.virtualEnabled}
+            onChange={(e) => update('virtualEnabled', e.target.checked)}
+          />
+          <div className="flex-1">
+            <div className="text-sm font-semibold text-text-primary">
+              Enable virtual grids (break 80-order limit)
+            </div>
+            <div className="text-xs text-text-muted mt-0.5">
+              GRVT caps open orders at 80/instrument. Virtual grids let you define
+              up to 500 conceptual levels; only the N closest to market price are
+              placed as real orders, and the window rotates as price moves.
+            </div>
+          </div>
+        </label>
+        {state.virtualEnabled && (
+          <div className="mt-4 grid grid-cols-2 gap-4 pl-7">
+            <Input
+              label="Active window size"
+              numeric
+              inputMode="numeric"
+              value={state.activeWindowSize}
+              onChange={(e) => update('activeWindowSize', e.target.value)}
+              helper="20 – 80 (default 70)"
+            />
+          </div>
+        )}
       </div>
       <div className="mt-4">
         <Input

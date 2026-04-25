@@ -162,22 +162,27 @@ class RateLimiter {
 const rateLimiter = new RateLimiter();
 
 // H.1: dynamic instrument specs cache. Populated by getInstruments(),
-// with hardcoded fallbacks for ETH/BTC so the bot works even if the
-// API call fails or hasn't been made yet.
+// with hardcoded fallbacks for the most common pairs so the bot works even
+// if the API call fails or hasn't been made yet.
 export interface InstrumentSpec {
   min_size: number;
   min_notional: number;
   tick_size: number;
+  // H.8 Multi-pair: required for EIP-712 signing. Falls back to safe
+  // defaults if unknown (base_decimals=9 is correct for most).
+  instrument_hash?: string;
+  base_decimals?: number;
 }
 
 const instrumentSpecsCache = new Map<string, InstrumentSpec>([
-  ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1 }],
-  ['ETH_USDT_Perp', { min_size: 0.01, min_notional: 20, tick_size: 0.01 }],
+  ['BTC_USDT_Perp', { min_size: 0.001, min_notional: 100, tick_size: 0.1, instrument_hash: '0x030501', base_decimals: 9 }],
+  ['ETH_USDT_Perp', { min_size: 0.001, min_notional: 20, tick_size: 0.01, instrument_hash: '0x030401', base_decimals: 9 }],
+  ['SOL_USDT_Perp', { min_size: 0.01, min_notional: 5, tick_size: 0.01, base_decimals: 9 }],
 ]);
 
 /** Get instrument specs — falls back to conservative defaults for unknown pairs. */
 export function getInstrumentSpec(pair: string): InstrumentSpec {
-  return instrumentSpecsCache.get(pair) ?? { min_size: 0.01, min_notional: 20, tick_size: 0.01 };
+  return instrumentSpecsCache.get(pair) ?? { min_size: 0.01, min_notional: 5, tick_size: 0.01, base_decimals: 9 };
 }
 
 /**
@@ -292,7 +297,8 @@ export class GRVTClient {
    */
   async getInstruments(): Promise<any[]> {
     const data = await publicRequest(`${MARKET_DATA_URL}/instruments`, {});
-    // H.1: cache instrument specs for dynamic pair support
+    // H.1: cache instrument specs for dynamic pair support.
+    // H.8: also cache instrument_hash + base_decimals for EIP-712 signing.
     if (Array.isArray(data)) {
       for (const inst of data) {
         const name = inst.instrument ?? inst.symbol ?? inst.name;
@@ -300,8 +306,18 @@ export class GRVTClient {
           const minSize = parseFloat(inst.base_min_size ?? inst.min_size ?? '0.01');
           const minNotional = parseFloat(inst.quote_min_size ?? inst.min_notional ?? '20');
           const tickSize = parseFloat(inst.tick_size ?? '0.01');
+          const instrumentHash = inst.instrument_hash;
+          const baseDecimals = inst.base_decimals != null
+            ? parseInt(String(inst.base_decimals), 10)
+            : 9;
           if (minSize > 0) {
-            instrumentSpecsCache.set(name, { min_size: minSize, min_notional: minNotional, tick_size: tickSize });
+            instrumentSpecsCache.set(name, {
+              min_size: minSize,
+              min_notional: minNotional,
+              tick_size: tickSize,
+              instrument_hash: instrumentHash,
+              base_decimals: baseDecimals,
+            });
           }
         }
       }
@@ -399,14 +415,28 @@ export class GRVTClient {
    */
   async getOpenOrders(instrument?: string): Promise<Order[]> {
     await rateLimiter.waitIfNeeded();
-    
+
     const body: any = { sub_account_id: this.tradingAccountId };
     if (instrument) {
       body.instrument = instrument;
     }
-    
+
     const data = await this.authedRequest(`${TRADING_URL}/open_orders`, body);
-    return Array.isArray(data) ? data : [];
+    const all = Array.isArray(data) ? data : [];
+
+    // DEFENSIVE: GRVT's open_orders endpoint sometimes ignores the `instrument`
+    // filter and returns ALL orders in the sub-account. Seen on 2026-04-16 when
+    // creating a SOL bot while ETH bot 44 had 93 open orders — GRVT returned
+    // all 93 ETH orders to the SOL query, which made the engine think SOL had
+    // 93 orphan orders. Filter client-side to guarantee correctness.
+    if (!instrument) return all;
+    return all.filter((o: any) => {
+      // instrument can be at the order level or inside legs[0]
+      if (o.instrument === instrument) return true;
+      const leg = o.legs?.[0];
+      if (leg?.instrument === instrument) return true;
+      return false;
+    });
   }
 
   /**

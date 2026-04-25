@@ -1,132 +1,103 @@
 # GRVT Grid — Roadmap
 
-> **Last updated**: 2026-04-10
-> **Current state**: Phase A (engine) and Phase B (dashboard + multi-tenancy) complete. Bot running in production.
+> **Last updated**: 2026-04-25
+> **Current state**: Phases A-H complete. Bots running in production (ETH 10x + SOL virtual grids 10x). Phase I (Lumina) paused.
 
 ---
 
 ## Completed
 
 ### Phase A — Grid Engine ✅
-Core grid trading engine on GRVT perpetual futures. LONG/SHORT strategies, post-only orders with retry, fill deduplication, rate-limit handling. Deployed and running live.
+Core grid trading engine on GRVT perpetual futures. LONG/SHORT strategies, post-only orders with retry, fill deduplication, rate-limit handling.
 
 ### Phase B — Dashboard + Multi-Tenancy ✅
 Full SPA (Vite + React + Tailwind + shadcn). GridChart with candle + grid overlays, equity curve, sparklines, 4-step create-bot wizard, live range update with preview, compound rebalancing, roundtrip tracking via FIFO fill pairing, multi-tenant auth (JWT + encrypted credentials), Docker self-host kit, Telegram notifier, light/dark theme.
 
-**Last commit**: `cf17018` — Roundtrips tab
+### Phase C — Hardening & Reliability ✅
+All 10/10 deployed. Structured logging (pino), per-user GRVT clients, liquidation safeguard, graceful shutdown, deep health check, pagination, processedFills pruning, one-bot-per-instrument guard, notifier health.
+
+### Phase D — Test Suite (partial)
+- D.2 + D.3 deployed (58 tests covering REST API + grid calculation).
+- D.1, D.4-D.9 still pending (see below).
+
+### Phase E — Dashboard Polish ✅ (8/9)
+E.1-E.8 deployed: drawdown gauge, keyboard shortcuts, optimistic UI, mobile breakpoints, modal responsiveness, fill heatmap, error toast, range picker drag handles. **E.9 (password recovery) still pending**.
+
+### Phase F — Notifications & Alerting ✅ (5/6)
+F.1-F.4 + F.6 deployed: per-bot thresholds, liq proximity, webhook sink, muted hours, alert history. **F.5 (email) skipped — Telegram is sufficient for current users**.
+
+### Phase G — Operations & Monitoring ✅
+All 6/6 deployed: Prometheus metrics, Grafana template, automated backups, rollback docs, log rotation, connection-loss docs.
+
+### Phase H — Advanced Trading ✅
+All 8/8 deployed including:
+- **H.8 — Virtual Grids** (the big one): user can configure up to 500 grid levels; engine maintains an "active window" of N closest-to-price levels (default 70, max 80 = GRVT cap minus margin) with the rest as `state='virtual'`. Window rotates as price moves: closer levels activate, farther ones get cancelled and demoted. Initial purchase counts ALL sell levels (incl virtuals) so backing is correct from day one. Schema: `grid_bots.virtual_enabled`, `grid_bots.active_window_size`, `grid_levels.state`.
+- Dashboard: virtual levels render as dotted muted lines on the chart, stats strip shows `N active · M virtual · K filled`, "VIRTUAL" entry in chart legend.
+
+### Profit audit + unification ✅ (2026-04-14)
+`paired_roundtrips.bot_id` added with backfill; single source of truth for grid profit (`SUM(profit) - SUM(fees)`); fixed cross-bot contamination.
+
+### Critical fixes (2026-04-25)
+- **Grid-coverage tolerance bug**: monitor's match tolerance was hardcoded `< 0.5` USD. With $0.25 grid step on SOL bot, a single GRVT order aliased to two adjacent DB levels → loser got re-placed → duplicates. Fixed: `matchTolerance = min(0.05, gridStep / 3)` per bot.
+- **Dup killer hardening**: threshold tightened from `active_window_size` to actual `expectedActiveLevels.length`. Added orphan detection that cancels GRVT orders whose price doesn't match any expected DB level.
+- **Fill detection**: monitor now checks both REST `getFillHistory` AND local WS-backed `fills_archive` before the 10s GRVT-lag skip — catches aggressive-candle fills inside the skip window.
+- **Bootstrap race conditions**: `bootstrapInProgress` + `bootstrapAbort` flags, gap-level marking at open, removed redundant SELL placement.
+- **Server access**: root `/` redirects to `/dashboard/`, basic auth skipped for SPA paths (the v2 app has its own JWT login).
 
 ---
 
-## Phase C — Hardening & Reliability
+## Pending
 
-Production is running but has gaps in resilience, observability, and data integrity. This phase makes the system trustworthy for real capital.
+### Phase D (remaining)
+| # | Task | Scope | Est |
+|---|------|-------|-----|
+| D.1 | Bot lifecycle integration test | `tests/integration/` | 2h |
+| D.4 | Compound rebalance tests | `tests/grid-engine.test.ts` | 1h |
+| D.5 | Range update tests | `tests/range-update.test.ts` | 2h |
+| D.6 | DB migration tests | `tests/db.test.ts` | 1h |
+| D.7 | Notifier tests | `packages/notifier/tests/` | 1h |
+| D.8 | Dashboard component tests | `packages/dashboard/tests/` | 2h |
+| D.9 | WebSocket tests | `tests/ws.test.ts` | 1h |
 
-| # | Task | Why | Files |
-|---|------|-----|-------|
-| C.1 | **Structured logging** — replace ~80 `console.log` calls in grid-engine with pino logger | Logs are unstructured, can't filter/aggregate. Pino is already imported in server/ but not used in engine | `bot/grid-engine.ts` |
-| C.2 | **Credential test on save** — call GRVT `getAccountSummary` when user saves credentials, set `last_test_ok` | Credentials are accepted blindly; bot creation fails with cryptic error if keys are wrong | `bot/src/server/v2-router.ts`, `api/grvt-client-factory.ts` |
-| C.3 | **Per-user GRVT client completion** — inject user's GrvtClient into GridBotInstance on create/start | Legacy bots still fall back to module-level singleton; multi-tenant is half-wired | `api/grvt-client-factory.ts`, `bot/grid-engine.ts` |
-| C.4 | **Liquidation proximity safeguard** — auto-pause bot if mark price is within X% of liquidation price, emit `safeguardTriggered` | Liquidation price is calculated but never acted on. Real money at risk | `bot/grid-engine.ts` (monitor loop) |
-| C.5 | **Graceful shutdown** — await in-flight `pollFillArchive` and `pollFundingHistory` before closing DB | Process kill during poll can lose fill data or corrupt SQLite WAL | `bot/grid-engine.ts`, `server/v2-bootstrap.ts` |
-| C.6 | **Health check depth** — `/api/health` should verify DB read + GRVT API reachability, not just uptime | Current health check is a lie — returns 200 even if DB is locked or GRVT is down | `server/v2-router.ts` |
-| C.7 | **Pagination on heavy endpoints** — add `?limit=` and `?offset=` to fills, orders, roundtrips, snapshots | `SELECT *` on fills_archive can return 100k+ rows, killing response time and memory | `server/v2-router.ts` |
-| C.8 | **Prune processedFills Set** — cap at last N entries or prune entries older than 24h | Set grows unbounded per bot instance; memory leak on long-running bots | `bot/grid-engine.ts` |
-| C.9 | **One-bot-per-instrument guard** — reject `POST /bots` if another active bot uses the same pair on the same sub-account | Fill attribution breaks silently if two bots share an instrument | `server/v2-router.ts`, `database/db.ts` |
-| C.10 | **Notifier health check** — add health endpoint or Docker HEALTHCHECK to notifier | Notifier can die silently; Docker won't restart it without a health check | `notifier/Dockerfile`, `docker-compose.yml` |
+### Phase E (remaining)
+| # | Task | Why | Est |
+|---|------|-----|-----|
+| E.9 | **Password recovery** — "Forgot password" link on login, email-based reset token | No recovery if password lost; requires server CLI access today | 2h |
 
----
+### Phase H (next-gen, all new)
+| # | Task | Why | Est |
+|---|------|-----|-----|
+| H.2 | **Dynamic grid (trailing)** — auto-shift range when price exits bounds | Static grid useless after big moves; user must manually update | 4h |
+| H.3 | **Stop-loss / take-profit** — auto-close bot at configurable threshold | No automated exit strategy | 3h |
+| H.5 | **Multi-sub-account** — connect multiple GRVT sub-accounts, run bots on each | Power-user isolation between strategies | 3h |
+| H.6 | **Backtesting** — simulate grid on historical candles | Test parameters before risking capital | 8h |
+| H.7 | **Portfolio view** — aggregate equity / PnL / risk across all bots | Overview lacks aggregate stats | 3h |
 
-## Phase D — Test Suite
-
-Coverage is <10%. No API tests, no dashboard tests, no notifier tests, no integration tests. This phase builds confidence for future changes.
-
-| # | Task | Scope |
-|---|------|-------|
-| D.1 | **Bot lifecycle integration test** — create → start → simulate fills → verify grid state → pause → close | `tests/integration/` |
-| D.2 | **REST API endpoint tests** — auth flow, CRUD bots, grid-state, range update, compound config | `tests/api/` |
-| D.3 | **Grid calculation tests** — `calculateGridLevels`, level spacing, qty/level, notional validation | `tests/grid-engine.test.ts` |
-| D.4 | **Compound rebalance tests** — threshold, interval, qty/level recalc, cash movement ledger | `tests/grid-engine.test.ts` |
-| D.5 | **Range update tests** — `buildRangeUpdatePlan`, `applyRangeUpdatePlan`, edge cases (no position, full position) | `tests/range-update.test.ts` |
-| D.6 | **Database migration tests** — schema creation, idempotent ALTERs, version tracking | `tests/db.test.ts` |
-| D.7 | **Notifier tests** — template rendering, fill batching, drawdown dedup, daily summary | `packages/notifier/tests/` |
-| D.8 | **Dashboard component tests** — BotCard, CreateBotWizard, GridChart, DataTable (vitest + testing-library) | `packages/dashboard/tests/` |
-| D.9 | **WebSocket tests** — subscribe/unsubscribe, reconnect, tick delivery, fill events | `tests/ws.test.ts` |
+### Phase I — Lumina Insurance Integration (paused)
+Plan exists at `~/.claude/plans/effervescent-sparking-lamport.md`. Deferred until Lumina vaults have non-zero TVL and/or a GRVT-specific product exists. Flash Insurance economics don't close yet for small-capital bots at low leverage.
 
 ---
 
-## Phase E — Dashboard Polish
-
-The dashboard is functional but missing some design-doc features and UX polish.
-
-| # | Task | Why |
-|---|------|-----|
-| E.1 | **Drawdown gauge** — animated risk meter on bot detail (design doc §6.4) | Specified in design language, not built. Key risk visualization |
-| E.2 | **Keyboard shortcuts modal** — `?` key opens overlay showing all shortcuts (design doc §11) | Design specifies `g o/b/s`, `n b`, `?`, `t`, `/` — none wired |
-| E.3 | **Optimistic UI updates** — start/pause/close reflect immediately in UI before server confirms | Current UX: button disables → waits for poll → updates. Feels sluggish |
-| E.4 | **Mobile breakpoints** — add `sm:` breakpoints for 375-640px, fluid GridChart height | Cards and tables cramped on small phones; chart has fixed px height |
-| E.5 | **Modal responsiveness** — modal width should shrink on mobile (currently fixed 560/720px) | Wizard overflow on phones <400px wide |
-| E.6 | **Grid activity heatmap** — fill density per level per time bucket (design doc §6.5, optional P1) | Nice-to-have for power users, shows which levels earn the most |
-| E.7 | **Global error toast for network failures** — catch fetch errors globally, show reconnecting state | Currently individual query errors; no global "offline" banner |
-| E.8 | **Range picker drag handles** — wizard step 2 range selection with chart drag (design doc §7.3) | Current implementation is numeric inputs; design shows drag-on-chart UX |
-| E.9 | **Password recovery flow** — "Forgot password" link on login, email-based reset token | No way to recover access if password is lost; currently requires server CLI access |
-
----
-
-## Phase F — Notifications & Alerting
-
-Telegram works. But a serious trading tool needs more channels and per-bot configuration.
-
-| # | Task | Why |
-|---|------|-----|
-| F.1 | **Per-bot alert thresholds** — configurable drawdown %, profit target, fill batch size per bot | Global 15% drawdown threshold doesn't fit all strategies; 2x leverage ETH vs 10x BTC need different thresholds |
-| F.2 | **Liquidation proximity alert** — notify when mark price is within configurable % of liq price | Engine calculates liq price but notifier never checks it |
-| F.3 | **Webhook sink** — generic HTTP POST to user-configured URL on any alert event | Enables Discord, Slack, PagerDuty, or custom integrations without code changes |
-| F.4 | **Muted hours** — configurable quiet period (e.g., don't alert 2-6am UTC) | Night alerts cause alert fatigue; users disable notifications entirely |
-| F.5 | **Email notifications** — SMTP or SendGrid for daily summaries and critical alerts | Some users don't use Telegram; email is universal |
-| F.6 | **Alert history in dashboard** — show past alerts in a table on Settings or per-bot | No way to see what alerts fired or were missed |
-
----
-
-## Phase G — Operations & Monitoring
-
-For users running this on a VPS with real money long-term.
-
-| # | Task | Why |
-|---|------|-----|
-| G.1 | **Prometheus metrics endpoint** — `/metrics` exposing bot count, fill rate, equity, error count, latency | No observability beyond logs. Can't set up Grafana alerts without metrics |
-| G.2 | **Grafana dashboard template** — JSON dashboard for the metrics above | Self-host users get a working dashboard out of the box |
-| G.3 | **Automated backups** — compose service or cron that snapshots `data/` to S3/Backblaze nightly | INSTALL.md mentions backups but nothing is automated; SQLite data loss = total loss |
-| G.4 | **Rollback mechanism** — versioned deploys with `docker compose` rollback instructions | Current update is `git pull + build`; a bad build with no rollback can brick the system |
-| G.5 | **Log rotation for ./logs/** — logrotate config or pino-roll integration | Logs grow unbounded on disk; compose logs to stdout but file logs in `./logs/` don't rotate |
-| G.6 | **Connection loss behavior docs** — document what happens when GRVT API is unreachable (orders stay? engine retries? pauses?) | Users don't know if their bot is safe during an outage |
-
----
-
-## Phase H — Advanced Trading Features
-
-New trading capabilities beyond basic grid.
-
-| # | Task | Why |
-|---|------|-----|
-| H.1 | **More pairs** — SOL, DOGE, ARB, or whatever GRVT lists; dynamic pair list from API | Only ETH and BTC hardcoded today; GRVT already supports more |
-| H.2 | **Dynamic grid** — auto-shift range when price exits bounds (trailing grid) | Static grid becomes useless after a 20% move; user has to manually update range |
-| H.3 | **Stop-loss / take-profit** — auto-close bot at configurable loss/profit threshold | No automated exit strategy; user must watch and close manually |
-| H.4 | **DCA mode** — dollar-cost-average into a position on a schedule, not grid-based | Common request for users who want exposure without grid complexity |
-| H.5 | **Multi-sub-account** — let a user connect multiple GRVT sub-accounts, run bots on each | Power users want isolation between strategies (conservative vs aggressive) |
-| H.6 | **Backtesting** — simulate grid on historical candles, show expected profit/drawdown | Users want to test parameters before risking capital |
-| H.7 | **Portfolio view** — aggregate equity, PnL, and risk across all bots in one view | Overview page shows per-bot cards but no aggregate stats beyond count |
-
----
-
-## Priority Order
+## Priority order (recommended next)
 
 ```
-C (hardening)  →  first, because production money is at risk
-D (tests)      →  second, so future changes don't break prod
-E (polish)     →  third, UX quality-of-life
-F (alerts)     →  fourth, better risk management
-G (ops)        →  fifth, operational maturity
-H (features)   →  sixth, new capabilities once foundation is solid
+1. E.9 — Password recovery       (~2h, quick UX win)
+2. H.2 — Dynamic grid trailing   (~4h, high user value)
+3. H.3 — Stop-loss / take-profit (~3h, risk management)
+4. H.5 — Multi-sub-account       (~3h, schema ready)
+5. H.7 — Portfolio view          (~3h, lifts overview UX)
+6. D remainders                  (~10h, test coverage)
+7. H.6 — Backtesting             (~8h, big feature)
 ```
 
-Each phase is independent enough to start in parallel if needed, but the dependency arrow above is the recommended order.
+Phase I (Lumina) waits for protocol maturity. No work scheduled.
+
+---
+
+## Production state (Apr 25)
+
+- **Bot 44**: ETH_USDT_Perp · LONG · 10x · 94 grids · realized $53+ · running
+- **Bot 48**: SOL_USDT_Perp · LONG · 10x · 120 virtual grids (window 70) · $100 invested · running
+- **VPS**: 46.62.149.136 port 3848 (caddy not in use; direct dashboard at `/dashboard/`)
+- **DB**: SQLite WAL at `/opt/grvt-grid-bot/data/grid_bot.db`
+- Service: systemd `grvt-grid-bot.service` (user `grvtbot`) + `grvt-grid-notifier.service`

@@ -41,6 +41,9 @@ export interface GridLevel {
   is_filled: 0 | 1;
   pending_replace: 0 | 1;
   order_id: string | null;
+  // H.8 virtual grids: level outside the active rotation window has no
+  // GRVT order and is rendered muted in the chart.
+  state?: 'active' | 'virtual' | 'filled';
 }
 
 export interface GridState {
@@ -204,6 +207,9 @@ export interface ValidateBotInput {
   num_grids: number;
   investment_usdt: number;
   leverage: number;
+  // H.8: Virtual grids
+  virtual_enabled?: boolean;
+  active_window_size?: number;
 }
 
 export interface ValidateBotResult {

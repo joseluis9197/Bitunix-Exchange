@@ -493,8 +493,26 @@ export function BotDetailPage() {
             <h2 className="text-sm font-semibold text-text-primary">
               Grid Chart
             </h2>
-            <p className="text-2xs uppercase tracking-wider text-text-muted mt-0.5">
-              {bot.pair} · 1H · {levels.length} levels
+            <p className="text-2xs uppercase tracking-wider text-text-muted mt-0.5 flex items-center gap-2 flex-wrap">
+              <span>{bot.pair} · 1H · {levels.length} levels</span>
+              {(() => {
+                const active = levels.filter((l) => l.is_filled === 0 && l.state !== 'virtual').length;
+                const virtual = levels.filter((l) => l.state === 'virtual').length;
+                const filled = levels.filter((l) => l.is_filled === 1).length;
+                return (
+                  <span className="flex items-center gap-1.5 normal-case tracking-normal">
+                    <span className="text-emerald-400">{active} active</span>
+                    {virtual > 0 && (
+                      <>
+                        <span className="text-text-muted">·</span>
+                        <span className="text-slate-500">{virtual} virtual</span>
+                      </>
+                    )}
+                    <span className="text-text-muted">·</span>
+                    <span className="text-text-muted">{filled} filled</span>
+                  </span>
+                );
+              })()}
             </p>
           </div>
           <ChartLegend />
@@ -1389,6 +1407,7 @@ function ChartLegend() {
     <div className="hidden md:flex items-center gap-4 text-2xs">
       <LegendDot color="bg-success" label="BUY" />
       <LegendDot color="bg-danger" label="SELL" />
+      <LegendDot color="bg-slate-700" label="VIRTUAL" />
       <LegendDot color="bg-border-strong" label="FILLED" />
       <LegendDot color="bg-warning" label="PENDING" />
       <LegendDot color="bg-primary" label="MARK" />

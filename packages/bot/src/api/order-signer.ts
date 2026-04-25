@@ -42,24 +42,29 @@ const EIP712_TYPES = {
 // ⚠️ CRÍTICO: PRICE_MULTIPLIER = 1e9 (verificado por Marta)
 const PRICE_MULTIPLIER = 1e9;
 
-// Mapeo de instrumentos a assetID (hash)
-// Verificado contra GET /full/v1/instruments el 2026-04-07
-// NOTE: hardcoded mapping is acceptable for the 2 pairs we currently trade.
-// For multi-pair support (Phase B), this should be loaded dynamically from the
-// instruments endpoint at startup and refreshed periodically.
-const INSTRUMENT_TO_ASSET_ID: Record<string, string> = {
-  'ETH_USDT_Perp': '0x030401', // verified from instrument_hash field
-  'BTC_USDT_Perp': '0x030501', // FIXED 2026-04-07: was '0x030201' (incorrect, never validated against API)
+// Legacy fallback — only consulted if the dynamic cache from client.ts
+// (populated by getInstruments()) doesn't have the instrument yet.
+import { getInstrumentSpec } from './client.js';
+
+const FALLBACK_INSTRUMENT_TO_ASSET_ID: Record<string, string> = {
+  'ETH_USDT_Perp': '0x030401',
+  'BTC_USDT_Perp': '0x030501',
 };
 
-// Configuración de decimales base (para contractSize)
-// Verificado contra GET /full/v1/instruments el 2026-04-07: ETH=9, BTC=9
-// IMPORTANT: other pairs use different values (e.g. ADA=6, AI16Z=6).
-// For multi-pair support (Phase B), load dynamically from instruments API.
-const INSTRUMENT_BASE_DECIMALS: Record<string, number> = {
+const FALLBACK_BASE_DECIMALS: Record<string, number> = {
   'ETH_USDT_Perp': 9,
   'BTC_USDT_Perp': 9,
 };
+
+function getAssetId(instrument: string): string | undefined {
+  const spec = getInstrumentSpec(instrument);
+  return spec.instrument_hash ?? FALLBACK_INSTRUMENT_TO_ASSET_ID[instrument];
+}
+
+function getBaseDecimals(instrument: string): number {
+  const spec = getInstrumentSpec(instrument);
+  return spec.base_decimals ?? FALLBACK_BASE_DECIMALS[instrument] ?? 9;
+}
 
 /**
  * Generar nonce aleatorio uint32
@@ -84,10 +89,11 @@ function generateExpiration(hours: number = 24): string {
  * ⚠️ ACTUALIZADO: usar base_decimals del instrumento
  */
 function sizeToContractSize(size: string, instrument: string): string {
-  // Round to min_size (0.01 for ETH, 0.001 for BTC) BEFORE computing contractSize
-  const minSize = instrument === 'BTC_USDT_Perp' ? 0.001 : 0.01;
+  // Round to min_size before computing contractSize
+  const spec = getInstrumentSpec(instrument);
+  const minSize = spec.min_size;
   const sizeNum = Math.floor(parseFloat(size) / minSize) * minSize;
-  const baseDecimals = INSTRUMENT_BASE_DECIMALS[instrument] || 9;
+  const baseDecimals = getBaseDecimals(instrument);
   const contractSize = Math.round(sizeNum * Math.pow(10, baseDecimals));
   return contractSize.toString();
 }
@@ -170,13 +176,10 @@ export async function signOrder(
 ): Promise<SignedOrder> {
   const { instrument, side, size, price, isMarket = false, timeInForce = 1, postOnly: postOnlyParam = false } = params;
 
-  // Validar que tengamos configuración para el instrumento
-  if (!INSTRUMENT_TO_ASSET_ID[instrument]) {
-    throw new Error(`Instrumento no soportado: ${instrument}`);
-  }
-
-  if (!INSTRUMENT_BASE_DECIMALS[instrument]) {
-    throw new Error(`Base decimals no configurados para: ${instrument}`);
+  // Validar que tengamos configuración para el instrumento (dinámica via getInstrumentSpec)
+  const assetIdCheck = getAssetId(instrument);
+  if (!assetIdCheck) {
+    throw new Error(`Instrumento no soportado (no instrument_hash en cache): ${instrument}. Reinicia el bot o llama getInstruments() primero.`);
   }
 
   // Para market orders, price es opcional
@@ -198,7 +201,7 @@ export async function signOrder(
   const expiration = generateExpiration(24); // 24 horas
 
   // Convertir parámetros a formato EIP-712 (formato verificado por Marta)
-  const assetID = INSTRUMENT_TO_ASSET_ID[instrument]; // ⚠️ CAMBIO: mantener como string hex
+  const assetID = getAssetId(instrument)!; // checked above
   const contractSize = sizeToContractSize(size, instrument);
   
   // Para market orders, usar price actual o 0 (será ignorado por el exchange)

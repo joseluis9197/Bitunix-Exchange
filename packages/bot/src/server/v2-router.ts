@@ -64,6 +64,8 @@ interface EngineOps {
     upperPrice: number;
     numGrids: number;
     investmentUSDT: number;
+    virtualEnabled?: boolean;
+    activeWindowSize?: number;
   }): Promise<number>;
   startBot(botId: number): Promise<void>;
   pauseBot(botId: number): Promise<void>;
@@ -613,7 +615,7 @@ export function createV2Router(deps: V2RouterDeps): Router {
     // of truth for what the bot WANTS to be doing. The orders array is what
     // GRVT actually has.
     const levels = await dbAll(db, `
-      SELECT id, level_index, price, side, quantity, is_filled, pending_replace, order_id
+      SELECT id, level_index, price, side, quantity, is_filled, pending_replace, order_id, state
       FROM grid_levels
       WHERE bot_id = ?
       ORDER BY level_index
@@ -742,16 +744,21 @@ export function createV2Router(deps: V2RouterDeps): Router {
     const roundtrips = await dbAll(db, `
       SELECT id, buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at
       FROM paired_roundtrips
-      WHERE COALESCE(user_id, 1) = ?
+      WHERE bot_id = ?
       ORDER BY id DESC
       LIMIT ? OFFSET ?
-    `, [userId, limit, offset]);
+    `, [id, limit, offset]);
     const total = await dbGet<{ c: number; sum: number }>(db, `
       SELECT COUNT(*) as c, COALESCE(SUM(profit), 0) as sum
       FROM paired_roundtrips
-      WHERE COALESCE(user_id, 1) = ?
-    `, [userId]);
-    res.json({ roundtrips, count: total?.c ?? 0, totalProfit: total?.sum ?? 0 });
+      WHERE bot_id = ?
+    `, [id]);
+    // Net profit = gross - fees (consistent with header "Realized")
+    const feeRow = await dbGet<{ f: number }>(db, `
+      SELECT COALESCE(SUM(fee), 0) as f FROM fills_archive WHERE bot_id = ?
+    `, [id]);
+    const netProfit = (total?.sum ?? 0) - (feeRow?.f ?? 0);
+    res.json({ roundtrips, count: total?.c ?? 0, totalProfit: netProfit });
     return;
   }));
 
@@ -865,27 +872,16 @@ export function createV2Router(deps: V2RouterDeps): Router {
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
     await requireBotOwnership(db, id, req.userId!);
 
-    // ── SOURCE OF TRUTH: paired_roundtrips ─────────────────────────
-    // paired_roundtrips is populated in real-time by the engine as each
-    // fill completes. It captures EVERY grid round-trip since bot
-    // creation. fills_archive, by contrast, is back-populated by the
-    // fill poller (added later) and may be incomplete — we found that
-    // fills_archive had 256 fills while paired_roundtrips had 314
-    // entries with the correct $85.87 total.
-    //
-    // For accurate profit tracking, we now use paired_roundtrips as
-    // the authoritative source. Fee data still comes from fills_archive
-    // (it's the only place that stores per-fill fee amounts).
-    const userId = req.userId!;
-
+    // SOURCE OF TRUTH: paired_roundtrips scoped by bot_id.
+    // Fee data from fills_archive (also scoped by bot_id).
     const rtStats = await dbGet<{ profit: number; count: number; earliest: string; latest: string }>(db, `
       SELECT COALESCE(SUM(profit), 0) as profit,
              COUNT(*) as count,
              MIN(created_at) as earliest,
              MAX(created_at) as latest
       FROM paired_roundtrips
-      WHERE COALESCE(user_id, 1) = ?
-    `, [userId]);
+      WHERE bot_id = ?
+    `, [id]);
 
     const feeStats = await dbGet<{ totalFees: number; fillCount: number }>(db, `
       SELECT COALESCE(SUM(fee), 0) as totalFees,
@@ -1239,11 +1235,21 @@ export function createV2Router(deps: V2RouterDeps): Router {
     const investment = Number(body.investment_usdt);
     const leverage = Number(body.leverage);
 
+    // H.8: virtual grids unlock num_grids up to 500 (vs 95 cap for legacy).
+    const virtualEnabledVal = (body as any).virtual_enabled === true;
+    const activeWindowSizeVal = Number((body as any).active_window_size);
+    const maxGrids = virtualEnabledVal ? 500 : 95;
+
     if (!Number.isFinite(lower) || lower <= 0) errors.push('lower_price must be > 0');
     if (!Number.isFinite(upper) || upper <= 0) errors.push('upper_price must be > 0');
     if (lower >= upper) errors.push('lower_price must be < upper_price');
-    if (!Number.isInteger(grids) || grids < 2 || grids > 95) {
-      errors.push('num_grids must be an integer between 2 and 95');
+    if (!Number.isInteger(grids) || grids < 2 || grids > maxGrids) {
+      errors.push(`num_grids must be an integer between 2 and ${maxGrids}`);
+    }
+    if (virtualEnabledVal) {
+      if (!Number.isInteger(activeWindowSizeVal) || activeWindowSizeVal < 20 || activeWindowSizeVal > 80) {
+        errors.push('active_window_size must be between 20 and 80 when virtual_enabled=true');
+      }
     }
     if (!Number.isFinite(investment) || investment <= 0) errors.push('investment_usdt must be > 0');
     if (!Number.isFinite(leverage) || leverage < 1 || leverage > 50) {
@@ -1287,9 +1293,9 @@ export function createV2Router(deps: V2RouterDeps): Router {
         : midPrice * (1 + (1 / leverage) * 0.95);
     const liqDistancePct = ((midPrice - liquidationEstimate) / midPrice) * 100;
 
-    // Tier 1 GRVT account is capped to 100 open orders. We hard-cap at 95
-    // here too so there's room for replacement orders during round-trips.
-    const overOrderCap = grids > 95;
+    // GRVT caps at 80 open orders per instrument. Without virtual grids, the
+    // bot can't exceed that. With virtual grids, only M ≤ 80 are active at once.
+    const overOrderCap = grids > 95 && !virtualEnabledVal;
 
     res.json({
       valid: true,
@@ -1336,6 +1342,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
       safeguard_enabled: boolean;
       safeguard_threshold_pct: number;
       safeguard_action: 'pause' | 'pause_close';
+      virtual_enabled: boolean;
+      active_window_size: number;
     }>;
 
     const errors: string[] = [];
@@ -1348,11 +1356,21 @@ export function createV2Router(deps: V2RouterDeps): Router {
     const investment = Number(body.investment_usdt);
     const leverage = Number(body.leverage);
 
+    // H.8: virtual grids
+    const virtualEnabled = body.virtual_enabled === true;
+    const activeWindowSize = Number(body.active_window_size);
+    const maxGridsPost = virtualEnabled ? 500 : 95;
+
     if (!Number.isFinite(lower) || lower <= 0) errors.push('lower_price must be > 0');
     if (!Number.isFinite(upper) || upper <= 0) errors.push('upper_price must be > 0');
     if (lower >= upper) errors.push('lower_price must be < upper_price');
-    if (!Number.isInteger(grids) || grids < 2 || grids > 95) {
-      errors.push('num_grids must be an integer between 2 and 95');
+    if (!Number.isInteger(grids) || grids < 2 || grids > maxGridsPost) {
+      errors.push(`num_grids must be an integer between 2 and ${maxGridsPost}`);
+    }
+    if (virtualEnabled) {
+      if (!Number.isInteger(activeWindowSize) || activeWindowSize < 20 || activeWindowSize > 80) {
+        errors.push('active_window_size must be between 20 and 80 when virtual_enabled=true');
+      }
     }
     if (!Number.isFinite(investment) || investment <= 0) errors.push('investment_usdt must be > 0');
     if (!Number.isFinite(leverage) || leverage < 1 || leverage > 50) {
@@ -1409,6 +1427,8 @@ export function createV2Router(deps: V2RouterDeps): Router {
         upperPrice: upper,
         numGrids: grids,
         investmentUSDT: investment,
+        virtualEnabled,
+        activeWindowSize: virtualEnabled ? activeWindowSize : undefined,
       });
       log.info({ botId, userId, pair, direction, leverage, grids }, 'bot created (paused)');
 
