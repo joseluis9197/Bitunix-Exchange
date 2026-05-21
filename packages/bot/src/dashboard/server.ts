@@ -26,6 +26,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.DASHBOARD_PORT || 3848;
 
+// SECURITY (H-6 follow-up): the bot sits behind a reverse proxy (Caddy
+// in Docker on this VPS). Without `trust proxy`, every user's req.ip
+// resolves to the proxy's bridge IP and express-rate-limit shares ONE
+// bucket across all users — one fat-finger locks out everyone for 15
+// min. Trust loopback + RFC1918 private networks (covers docker bridge
+// 172.16-31.x, lan 10.x/192.168.x, link-local 169.254.x). Public IPs
+// are not in this set, so X-Forwarded-For cannot be spoofed by an
+// external attacker to evade rate-limiting.
+app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+
 // Initialize database and grid engine
 async function initializeServices() {
   try {
