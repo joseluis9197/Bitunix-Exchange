@@ -47,6 +47,12 @@ interface NotifierConfig {
   webhookSecret: string | undefined;
   mutedHoursStart: number;       // F.4: -1 = disabled
   mutedHoursEnd: number;
+  // Single-tenant Telegram routing: only alerts owned by this user_id
+  // are sent to TELEGRAM_CHAT_ID. Every other user's alerts still hit
+  // the webhook (for the dashboard /api/v2/alerts feed). Per-user
+  // Telegram chat IDs are future work.
+  // Default 1 = the operator (matching v2-router's COALESCE policy).
+  operatorUserId: number;
 }
 
 function loadConfig(): NotifierConfig {
@@ -64,6 +70,7 @@ function loadConfig(): NotifierConfig {
     webhookSecret: process.env.WEBHOOK_SECRET,
     mutedHoursStart: parseInt(process.env.MUTED_HOURS_START_UTC ?? '-1', 10),
     mutedHoursEnd: parseInt(process.env.MUTED_HOURS_END_UTC ?? '-1', 10),
+    operatorUserId: parseInt(process.env.OPERATOR_USER_ID ?? '1', 10),
   };
 }
 
@@ -111,6 +118,13 @@ class Notifier {
    * the bot can filter per JWT-authed user. Callers MUST pass the
    * owning user — there is no "system-wide" alert that gets shown to
    * everyone (that would leak one user's drawdown to another).
+   *
+   * Telegram routing: single-tenant. Only `cfg.operatorUserId` events
+   * reach TELEGRAM_CHAT_ID. Every other user's alerts still hit the
+   * webhook and the alert history file, so the dashboard's
+   * /api/v2/alerts feed remains complete per-user. Before this filter
+   * the operator's chat received every tenant's activity — see
+   * 2026-05-28 incident report in SECURITY.md.
    */
   private async notify(
     text: string,
@@ -133,10 +147,13 @@ class Notifier {
       data: event.data,
     });
 
-    await Promise.allSettled([
-      this.telegram.send(text),
+    const tasks: Promise<unknown>[] = [
       this.webhook.send({ ...event, message: text }),
-    ]);
+    ];
+    if (event.userId === this.cfg.operatorUserId) {
+      tasks.push(this.telegram.send(text));
+    }
+    await Promise.allSettled(tasks);
   }
 
   /**
