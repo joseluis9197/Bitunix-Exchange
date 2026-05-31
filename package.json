@@ -1,16 +1,16 @@
 {
-  "name": "grvt-grid",
+  "name": "bitunix-exchange",
   "version": "0.1.0",
   "private": true,
-  "description": "Self-hostable multi-user grid trading bot for GRVT perpetual futures, with real-time dashboard and Telegram alerts.",
+  "description": "Self-hostable multi-user grid trading bot for Bitunix Futures, with real-time dashboard and Telegram alerts.",
   "license": "AGPL-3.0-or-later",
-  "homepage": "https://grvtbot.com",
+  "homepage": "https://bots.prosperollc.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kmanus88/GRVTBot.git"
+    "url": "https://github.com/joseluis9197/Bitunix-Exchange.git"
   },
   "bugs": {
-    "url": "https://github.com/kmanus88/GRVTBot/issues"
+    "url": "https://github.com/joseluis9197/Bitunix-Exchange/issues"
   },
   "workspaces": [
     "packages/*"

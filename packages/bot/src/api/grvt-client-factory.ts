@@ -21,20 +21,27 @@
 // When a running bot's user updates their creds:
 //   engine.rebindGrvtClient(userId, subAccountId);  // replaces instance refs
 
-import { GRVTClient, type GrvtClientCreds } from './client.js';
+import {
+  createExchangeClient,
+  getDefaultExchangeId,
+  normalizeExchange,
+  type ExchangeId,
+  type ExchangeClientCreds,
+  type TradingClient,
+} from './client.js';
 import { decryptCredentialFields } from '../auth/crypto.js';
 import type { GridBotDB } from '../database/db.js';
 
 interface CacheEntry {
-  client: GRVTClient;
+  client: TradingClient;
   expiresAt: number;
 }
 
 const cache = new Map<string, CacheEntry>();
 const TTL_MS = 5 * 60 * 1000; // 5 minutes
 
-function cacheKey(userId: number, subAccountId: number | null): string {
-  return `${userId}:${subAccountId ?? 'default'}`;
+function cacheKey(userId: number, subAccountId: number | null, exchange: ExchangeId): string {
+  return `${exchange}:${userId}:${subAccountId ?? 'default'}`;
 }
 
 /**
@@ -48,9 +55,11 @@ function cacheKey(userId: number, subAccountId: number | null): string {
 export async function getGrvtClientForBot(
   userId: number,
   subAccountId: number | null,
-  gridBotDb: GridBotDB
-): Promise<GRVTClient> {
-  const key = cacheKey(userId, subAccountId);
+  gridBotDb: GridBotDB,
+  exchangeArg?: ExchangeId | string | null
+): Promise<TradingClient> {
+  const exchange = normalizeExchange(exchangeArg ?? getDefaultExchangeId());
+  const key = cacheKey(userId, subAccountId, exchange);
   const hit = cache.get(key);
   if (hit && hit.expiresAt > Date.now()) {
     return hit.client;
@@ -59,9 +68,9 @@ export async function getGrvtClientForBot(
   // Resolve encrypted creds: default vs sub-account.
   let row: Parameters<typeof decryptCredentialFields>[0] | null = null;
   if (subAccountId == null) {
-    row = await gridBotDb.getGrvtCredentialsRaw(userId);
+    row = await (gridBotDb as any).getGrvtCredentialsRaw(userId, exchange);
     if (!row) {
-      throw new Error(`User ${userId} has no GRVT credentials configured`);
+      throw new Error(`User ${userId} has no ${exchange.toUpperCase()} credentials configured`);
     }
   } else {
     const sub = await gridBotDb.getGrvtSubAccountRaw(subAccountId);
@@ -76,23 +85,28 @@ export async function getGrvtClientForBot(
         `Sub-account ${subAccountId} does not belong to user ${userId}`
       );
     }
+    if (normalizeExchange((sub as any).exchange ?? 'grvt') !== exchange) {
+      throw new Error(
+        `Sub-account ${subAccountId} is for ${normalizeExchange((sub as any).exchange ?? 'grvt')}, not ${exchange}`
+      );
+    }
     row = sub;
   }
 
   const plain = decryptCredentialFields(row);
-  const creds: GrvtClientCreds = {
+  const creds: ExchangeClientCreds = {
     apiKey: plain.apiKey,
     apiSecret: plain.apiSecret,
     tradingAddress: plain.tradingAddress,
     accountId: plain.accountId,
     subAccountId: plain.subAccountId,
   };
-  const client = new GRVTClient(creds);
+  const client = createExchangeClient(exchange, creds);
 
   const ok = await client.login();
   if (!ok) {
     throw new Error(
-      `GRVT login failed for user ${userId}${subAccountId != null ? ` sub-account ${subAccountId}` : ''}`
+      `${exchange.toUpperCase()} login failed for user ${userId}${subAccountId != null ? ` sub-account ${subAccountId}` : ''}`
     );
   }
 
@@ -101,7 +115,7 @@ export async function getGrvtClientForBot(
   // Touch last_used_at on the default credentials path (the only one
   // with that bookkeeping column today). Fire and forget.
   if (subAccountId == null) {
-    gridBotDb.touchGrvtCredentialsLastUsed(userId).catch(() => {});
+    gridBotDb.touchGrvtCredentialsLastUsed(userId, exchange).catch(() => {});
   }
 
   return client;
@@ -114,9 +128,10 @@ export async function getGrvtClientForBot(
  */
 export async function getGrvtClientForUser(
   userId: number,
-  gridBotDb: GridBotDB
-): Promise<GRVTClient> {
-  return getGrvtClientForBot(userId, null, gridBotDb);
+  gridBotDb: GridBotDB,
+  exchange?: ExchangeId | string | null
+): Promise<TradingClient> {
+  return getGrvtClientForBot(userId, null, gridBotDb, exchange);
 }
 
 /**
@@ -125,15 +140,26 @@ export async function getGrvtClientForUser(
  * the default and all sub-accounts at once). With a subAccountId,
  * removes only that exact key.
  */
-export function invalidateGrvtClient(userId: number, subAccountId?: number | null): void {
+export function invalidateGrvtClient(
+  userId: number,
+  subAccountId?: number | null,
+  exchangeArg?: ExchangeId | string | null
+): void {
+  const exchange = exchangeArg == null ? null : normalizeExchange(exchangeArg);
   if (subAccountId === undefined) {
-    const prefix = `${userId}:`;
+    const prefix = exchange ? `${exchange}:${userId}:` : null;
     for (const k of Array.from(cache.keys())) {
-      if (k.startsWith(prefix)) cache.delete(k);
+      if (prefix ? k.startsWith(prefix) : k.includes(`:${userId}:`)) cache.delete(k);
     }
     return;
   }
-  cache.delete(cacheKey(userId, subAccountId));
+  if (exchange) {
+    cache.delete(cacheKey(userId, subAccountId, exchange));
+    return;
+  }
+  for (const x of ['grvt', 'bitunix'] as const) {
+    cache.delete(cacheKey(userId, subAccountId, x));
+  }
 }
 
 /** Drop all cached clients. Call on server shutdown. */

@@ -12,6 +12,7 @@ import {
   type Candle,
   type CandleInterval,
   type DailySnapshot,
+  type ExchangeBalance,
   type FillRow,
   type FundingRow,
   type GridState,
@@ -110,8 +111,14 @@ export const api = {
   getBot: (id: number) => request<{ bot: BotSummary }>(`/bots/${id}`),
   getGridState: (id: number) => request<GridState>(`/bots/${id}/grid-state`),
 
-  getInstruments: () => request<{ instruments: unknown[] }>('/instruments'),
-  getBalance: () => request<{ balance: unknown }>('/balance'),
+  getInstruments: (exchange?: 'grvt' | 'bitunix') => {
+    const qs = exchange ? `?exchange=${encodeURIComponent(exchange)}` : '';
+    return request<{ instruments: unknown[] }>(`/instruments${qs}`);
+  },
+  getBalance: (exchange?: 'grvt' | 'bitunix') => {
+    const qs = exchange ? `?exchange=${encodeURIComponent(exchange)}` : '';
+    return request<{ balance: ExchangeBalance }>(`/balance${qs}`);
+  },
 
   getTrades: (id: number, opts: { limit?: number } = {}) => {
     const qs = new URLSearchParams();
@@ -280,13 +287,15 @@ export const api = {
   getCandles: (
     pair: string,
     interval: CandleInterval = 'CI_1_H',
-    limit = 500
+    limit = 500,
+    exchange?: 'grvt' | 'bitunix'
   ) => {
     const qs = new URLSearchParams({
       pair,
       interval,
       limit: String(limit),
     });
+    if (exchange) qs.set('exchange', exchange);
     return request<{ pair: string; interval: string; candles: Candle[] }>(
       `/candles?${qs.toString()}`
     );
@@ -337,6 +346,7 @@ export const api = {
     }>('/auth/tos'),
 
   saveGrvtCredentials: (body: {
+    exchange?: 'grvt' | 'bitunix';
     apiKey: string;
     apiSecret: string;
     tradingAddress: string;
@@ -359,6 +369,7 @@ export const api = {
   listSubAccounts: () =>
     request<Array<{
       id: number;
+      exchange?: 'grvt' | 'bitunix';
       label: string;
       isDefault: boolean;
       lastTestOk: boolean | null;
@@ -366,6 +377,7 @@ export const api = {
     }>>('/auth/grvt-sub-accounts'),
 
   createSubAccount: (body: {
+    exchange?: 'grvt' | 'bitunix';
     label: string;
     apiKey: string;
     apiSecret: string;
@@ -377,6 +389,7 @@ export const api = {
   }) =>
     request<{
       id: number;
+      exchange?: 'grvt' | 'bitunix';
       label: string;
       isDefault: boolean;
       equity: string | null;

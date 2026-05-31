@@ -6,6 +6,7 @@ export type BotStatus = 'running' | 'paused' | 'stopped' | 'error';
 
 export interface BotSummary {
   id: number;
+  exchange?: 'grvt' | 'bitunix';
   pair: string;
   direction: 'long' | 'short';
   leverage: number;
@@ -60,6 +61,7 @@ export interface GridLevel {
 
 export interface GridState {
   botId: number;
+  exchange?: 'grvt' | 'bitunix';
   pair: string;
   status: BotStatus;
   levels: GridLevel[];
@@ -205,6 +207,16 @@ export interface PortfolioSummary {
   pairExposure: Record<string, number>;
 }
 
+export interface ExchangeBalance {
+  sub_account_id: string;
+  total_equity: string;
+  available_balance: string;
+  margin_used: string;
+  maintenance_margin: string;
+  initial_margin: string;
+  currency: string;
+}
+
 // H.7: per-day equity, summed across the user's non-stopped bots.
 // Returned by GET /api/v2/portfolio-equity-curve.
 export interface PortfolioEquityPoint {
@@ -264,6 +276,7 @@ export interface FundingRow {
 }
 
 export interface ValidateBotInput {
+  exchange?: 'grvt' | 'bitunix';
   pair: string;
   direction: 'long' | 'short';
   lower_price: number;
@@ -281,6 +294,7 @@ export interface ValidateBotInput {
 // H.5: GRVT sub-account row as the dashboard sees it (no encrypted fields).
 export interface GrvtSubAccount {
   id: number;
+  exchange?: 'grvt' | 'bitunix';
   label: string;
   isDefault: boolean;
   lastTestOk: boolean | null;
@@ -289,6 +303,7 @@ export interface GrvtSubAccount {
 
 export interface ValidateBotResult {
   valid: true;
+  exchange?: 'grvt' | 'bitunix';
   pair: string;
   direction: 'long' | 'short';
   input: {

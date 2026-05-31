@@ -8,13 +8,19 @@ const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
   mockGrvtClient: {
     getOpenOrders: vi.fn(),
     getFillHistory: vi.fn(),
+    getPosition: vi.fn(),
+    getPositions: vi.fn(),
+    getBalance: vi.fn(),
+    getFundingHistory: vi.fn(),
     getTicker: vi.fn(),
     getAccountSummary: vi.fn(),
     createOrder: vi.fn(),
     cancelOrder: vi.fn(),
     cancelAllOrders: vi.fn(),
     getInstruments: vi.fn(),
+    setLeverage: vi.fn(),
     login: vi.fn(),
+    subAccountId: 'mock-sub',
   },
   mockDb: {
     getBot: vi.fn(),
@@ -32,6 +38,8 @@ const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
     close: vi.fn(),
     getLastFillArchiveTimestamp: vi.fn(),
     insertFillArchive: vi.fn(),
+    getFillsForBot: vi.fn(),
+    clearPairedRoundtripsForBot: vi.fn(),
     insertPairedRoundtrip: vi.fn(),
     getFillsArchive: vi.fn(),
     getPairedRoundtrips: vi.fn(),
@@ -42,6 +50,18 @@ const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
 vi.mock('../src/api/client.js', () => ({
   grvtClient: mockGrvtClient,
   GRVTClient: vi.fn(),
+  getDefaultExchangeId: () => 'grvt',
+  normalizeExchange: (value: unknown) => (value === 'bitunix' ? 'bitunix' : 'grvt'),
+  createExchangeClient: vi.fn(() => mockGrvtClient),
+  getInstrumentSpec: (pair: string) => {
+    if (pair === 'BTC_USDT_Perp') return { min_size: 0.001, min_notional: 100, tick_size: 0.1 };
+    return { min_size: 0.01, min_notional: 20, tick_size: 0.01 };
+  },
+}));
+
+vi.mock('../src/api/grvt-client-factory.js', () => ({
+  getGrvtClientForBot: vi.fn().mockResolvedValue(mockGrvtClient),
+  invalidateGrvtClient: vi.fn(),
 }));
 
 vi.mock('../src/database/db.js', () => ({
@@ -75,6 +95,7 @@ describe('GridBotInstance', () => {
     mockDb.getBot.mockResolvedValue(mockBot);
     mockDb.getGridLevels.mockResolvedValue([]);
     mockDb.getOrders.mockResolvedValue([]);
+    mockDb.getFillsForBot.mockResolvedValue([]);
     mockDb.getFillsArchive.mockResolvedValue([]);
     mockDb.getPairedRoundtrips.mockResolvedValue([]);
 

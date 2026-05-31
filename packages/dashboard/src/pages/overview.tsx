@@ -44,6 +44,14 @@ export function OverviewPage() {
     staleTime: 2_000,
   });
 
+  const balanceQuery = useQuery({
+    queryKey: ['balance', 'bitunix'],
+    queryFn: () => api.getBalance('bitunix'),
+    refetchInterval: 5_000,
+    staleTime: 2_000,
+    retry: false,
+  });
+
   // Equity curve refreshes less often — daily_snapshots are written ~1/day.
   const curveQuery = useQuery({
     queryKey: ['portfolio-equity-curve'],
@@ -118,6 +126,9 @@ export function OverviewPage() {
   const avgLeverage = summary?.avgLeverage ?? 0;
   const pairExposure = summary?.pairExposure ?? {};
   const runningCount = summary?.runningCount ?? bots.filter((b) => b.status === 'running').length;
+  const bitunixBalance = balanceQuery.data?.balance;
+  const bitunixEquity = Number(bitunixBalance?.total_equity ?? 0);
+  const bitunixAvailable = Number(bitunixBalance?.available_balance ?? 0);
 
   return (
     <div className="flex flex-col gap-6">
@@ -141,13 +152,26 @@ export function OverviewPage() {
         </Button>
       </div>
 
-      {/* Aggregate stat strip */}
+      {/* Live exchange balance */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-px bg-border-subtle rounded-lg overflow-hidden">
         <StatCard
-          label={t('overview.totalEquity')}
+          label="Balance Bitunix"
+          value={balanceQuery.isError ? 'Error' : formatUsd(bitunixEquity)}
+        />
+        <StatCard
+          label="Disponible Bitunix"
+          value={balanceQuery.isError ? 'Error' : formatUsd(bitunixAvailable)}
+        />
+        <StatCard
+          label="Equity en bots"
           value={formatUsd(totalEquity)}
           delta={<Delta value={totalPnlPct} format={formatPercent} />}
         />
+        <StatCard label={t('overview.invested')} value={formatUsdCompact(totalInvested)} />
+      </div>
+
+      {/* Aggregate bot stat strip */}
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-px bg-border-subtle rounded-lg overflow-hidden">
         <StatCard
           label={t('overview.totalPnl')}
           value={
@@ -184,9 +208,8 @@ export function OverviewPage() {
       </div>
 
       {/* Risk strip — H.7 */}
-      <div className="grid grid-cols-2 md:grid-cols-3 gap-px bg-border-subtle rounded-lg overflow-hidden">
+      <div className="grid grid-cols-2 md:grid-cols-2 gap-px bg-border-subtle rounded-lg overflow-hidden">
         <StatCard label={t('overview.positionNotional')} value={formatUsdCompact(totalPositionUsdt)} />
-        <StatCard label={t('overview.invested')} value={formatUsdCompact(totalInvested)} />
         <StatCard label={t('overview.avgLeverage')} value={`${avgLeverage.toFixed(1)}x`} />
       </div>
 

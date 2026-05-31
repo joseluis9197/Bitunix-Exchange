@@ -88,9 +88,14 @@ export function BotDetailPage() {
 
   // Candles — 1H, last ~7 days. Cached on the server (30s for 1H).
   const candlesQuery = useQuery({
-    queryKey: ['candles', botQuery.data?.bot.pair, 'CI_1_H'],
+    queryKey: ['candles', botQuery.data?.bot.exchange ?? 'grvt', botQuery.data?.bot.pair, 'CI_1_H'],
     queryFn: () =>
-      api.getCandles(botQuery.data?.bot.pair ?? 'ETH_USDT_Perp', 'CI_1_H', 200),
+      api.getCandles(
+        botQuery.data?.bot.pair ?? 'ETH_USDT_Perp',
+        'CI_1_H',
+        200,
+        botQuery.data?.bot.exchange ?? 'grvt'
+      ),
     enabled: !!botQuery.data?.bot.pair,
     refetchInterval: 60_000,
   });

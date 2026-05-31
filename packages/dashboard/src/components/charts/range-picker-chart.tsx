@@ -19,6 +19,7 @@ import { api } from '@/lib/api-client';
 
 interface RangePickerChartProps {
   pair: string;
+  exchange?: 'grvt' | 'bitunix';
   lower: number;
   upper: number;
   onLowerChange: (v: number) => void;
@@ -27,6 +28,7 @@ interface RangePickerChartProps {
 
 export function RangePickerChart({
   pair,
+  exchange = 'grvt',
   lower,
   upper,
   onLowerChange,
@@ -41,8 +43,8 @@ export function RangePickerChart({
   const [dragging, setDragging] = useState<'lower' | 'upper' | null>(null);
 
   const candlesQuery = useQuery({
-    queryKey: ['candles', pair, 'CI_1_H', 168],
-    queryFn: () => api.getCandles(pair, 'CI_1_H', 168),
+    queryKey: ['candles', exchange, pair, 'CI_1_H', 168],
+    queryFn: () => api.getCandles(pair, 'CI_1_H', 168, exchange),
     staleTime: 60_000,
     enabled: !!pair,
   });

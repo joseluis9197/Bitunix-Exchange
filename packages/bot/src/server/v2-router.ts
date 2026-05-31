@@ -22,8 +22,15 @@ import { hashPassword, verifyPassword } from '../auth/passwords.js';
 import { signToken, verifyToken } from '../auth/jwt.js';
 import { encryptCredentialFields } from '../auth/crypto.js';
 import { sendPasswordResetEmail, isMailerConfigured } from '../mail/mailer.js';
-import { GRVTClient, type GrvtClientCreds } from '../api/client.js';
-import { invalidateGrvtClient } from '../api/grvt-client-factory.js';
+import {
+  createExchangeClient,
+  getDefaultExchangeId,
+  normalizeExchange,
+  type ExchangeClientCreds,
+  type ExchangeId,
+} from '../api/client.js';
+import { getGrvtClientForBot, invalidateGrvtClient } from '../api/grvt-client-factory.js';
+import { computeQtyPerLevelForPair } from '../bot/quantity.js';
 
 // Augment Express Request to carry the authenticated user id set
 // by the JWT middleware. Every protected handler reads req.userId.
@@ -59,6 +66,7 @@ interface GrvtClient {
 interface EngineOps {
   createBot(config: {
     userId: number;
+    exchange?: ExchangeId;
     pair: string;
     direction: 'long' | 'short';
     leverage: number;
@@ -85,7 +93,7 @@ interface EngineOps {
   // refreshes ALL bots owned by the user (default-creds rotation).
   // With subAccountId provided it only refreshes bots routed through
   // that specific sub-account.
-  rebindGrvtClient?(userId: number, subAccountId?: number | null): Promise<void>;
+  rebindGrvtClient?(userId: number, subAccountId?: number | null, exchange?: ExchangeId | string | null): Promise<void>;
 }
 
 export interface V2RouterDeps {
@@ -103,6 +111,134 @@ export interface V2RouterDeps {
 function round(n: number, digits: number): number {
   const f = 10 ** digits;
   return Math.round(n * f) / f;
+}
+
+const botStartNsSql = "CAST(strftime('%s', b.created_at) AS INTEGER) * 1000000000";
+
+const pairCreatedNsSql = `
+  CASE
+    WHEN pr.created_at NOT GLOB '*[^0-9]*'
+      THEN CAST(pr.created_at AS INTEGER)
+    ELSE CAST(strftime('%s', pr.created_at) AS INTEGER) * 1000000000
+  END
+`;
+
+interface ScopedFill {
+  fill_id: string;
+  event_time: string;
+  is_buyer: number;
+  price: number;
+  size: number;
+  fee: number;
+  created_at: string;
+}
+
+function computeRealizedFromFills(
+  fills: ScopedFill[],
+  direction: 'long' | 'short'
+): {
+  gridProfit: number;
+  totalFees: number;
+  netGridProfit: number;
+  pairs: number;
+  avgPerPair: number;
+  fillCount: number;
+  unpairedBuys: number;
+  unpairedSells: number;
+  firstFillAt: string | null;
+  lastFillAt: string | null;
+} {
+  const openLots: Array<{ price: number; size: number }> = [];
+  let gridProfit = 0;
+  let totalFees = 0;
+  let pairs = 0;
+  let unpairedBuys = 0;
+  let unpairedSells = 0;
+  const EPS = 1e-9;
+
+  for (const f of fills) {
+    totalFees += Number(f.fee ?? 0);
+    const isBuy = Number(f.is_buyer) === 1;
+    const opensPosition = (direction === 'long' && isBuy) || (direction === 'short' && !isBuy);
+
+    if (opensPosition) {
+      openLots.push({ price: Number(f.price), size: Number(f.size) });
+      continue;
+    }
+
+    let remaining = Number(f.size);
+    while (remaining > EPS && openLots.length > 0) {
+      const lot = openLots[0]!;
+      const matched = Math.min(lot.size, remaining);
+      const buyPrice = direction === 'long' ? lot.price : Number(f.price);
+      const sellPrice = direction === 'long' ? Number(f.price) : lot.price;
+      gridProfit += (sellPrice - buyPrice) * matched;
+      pairs++;
+      lot.size -= matched;
+      remaining -= matched;
+      if (lot.size <= EPS) openLots.shift();
+    }
+
+    if (remaining > EPS) {
+      if (isBuy) unpairedBuys++;
+      else unpairedSells++;
+    }
+  }
+
+  return {
+    gridProfit,
+    totalFees,
+    netGridProfit: gridProfit - totalFees,
+    pairs,
+    avgPerPair: pairs > 0 ? gridProfit / pairs : 0,
+    fillCount: fills.length,
+    unpairedBuys,
+    unpairedSells,
+    firstFillAt: fills[0]?.event_time ?? null,
+    lastFillAt: fills[fills.length - 1]?.event_time ?? null,
+  };
+}
+
+function parseDbTimestampMs(value?: string | null): number | null {
+  if (!value) return null;
+  const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function eventTimeNsToMs(value: string): number | null {
+  try {
+    return Number(BigInt(value) / 1_000_000n);
+  } catch {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.floor(n / 1_000_000) : null;
+  }
+}
+
+function exchangeFromRequest(value: unknown): ExchangeId {
+  return normalizeExchange(value ?? getDefaultExchangeId());
+}
+
+function validateCredentialShape(input: {
+  exchange: ExchangeId;
+  apiKey: string;
+  apiSecret: string;
+  tradingAddress: string;
+  accountId: string;
+}): string[] {
+  const errors: string[] = [];
+  if (!input.apiKey) errors.push('apiKey is required');
+  if (!input.apiSecret) errors.push('apiSecret is required');
+  if (input.exchange === 'grvt') {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(input.apiSecret)) {
+      errors.push('apiSecret must be a 0x-prefixed 32-byte hex string');
+    }
+    if (!input.tradingAddress || !/^0x[0-9a-fA-F]{40}$/.test(input.tradingAddress)) {
+      errors.push('tradingAddress must be a 0x-prefixed Ethereum address');
+    }
+    if (!input.accountId) errors.push('accountId is required');
+  }
+  return errors;
 }
 
 function dbAll<T = unknown>(db: Database.Database, sql: string, params: unknown[] = []): Promise<T[]> {
@@ -751,11 +887,13 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       tradingAddress?: unknown;
       accountId?: unknown;
       subAccountId?: unknown;
+      exchange?: unknown;
     };
+    const exchange = exchangeFromRequest(body.exchange);
     const apiKey = String(body.apiKey ?? '').trim();
     const apiSecret = String(body.apiSecret ?? '').trim();
     const tradingAddress = String(body.tradingAddress ?? '').trim();
-    const accountId = String(body.accountId ?? '').trim();
+    const accountId = String(body.accountId ?? '').trim() || (exchange === 'bitunix' ? 'bitunix' : '');
     // Sub-account is optional in the UI: when omitted, default to the
     // account id. Most GRVT users only have one sub-account whose id
     // equals the account id, so this removes a confusing field for
@@ -763,22 +901,13 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     // specific sub-account when they have several.
     const subAccountId = String(body.subAccountId ?? '').trim() || accountId;
 
-    const errors: string[] = [];
-    if (!apiKey) errors.push('apiKey is required');
-    if (!apiSecret) errors.push('apiSecret is required');
-    if (!/^0x[0-9a-fA-F]{64}$/.test(apiSecret)) {
-      errors.push('apiSecret must be a 0x-prefixed 32-byte hex string');
-    }
-    if (!tradingAddress || !/^0x[0-9a-fA-F]{40}$/.test(tradingAddress)) {
-      errors.push('tradingAddress must be a 0x-prefixed Ethereum address');
-    }
-    if (!accountId) errors.push('accountId is required');
+    const errors = validateCredentialShape({ exchange, apiKey, apiSecret, tradingAddress, accountId });
     if (errors.length > 0) {
       return res.status(400).json({ error: 'validation_failed', errors });
     }
 
     // C.2: verify credentials against GRVT before persisting.
-    const plainCreds: GrvtClientCreds = {
+    const plainCreds: ExchangeClientCreds = {
       apiKey,
       apiSecret,
       tradingAddress,
@@ -787,27 +916,27 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     };
     let testEquity: string | null = null;
     try {
-      const testClient = new GRVTClient(plainCreds);
+      const testClient = createExchangeClient(exchange, plainCreds);
       const loggedIn = await testClient.login();
       if (!loggedIn) {
-        log.warn({ userId }, 'GRVT credential test: login returned false');
+        log.warn({ userId, exchange }, 'credential test: login returned false');
         return res.status(400).json({
           error: 'credential_test_failed',
           stage: 'login',
-          message: 'GRVT login failed — check apiKey and apiSecret',
+          message: `${exchange.toUpperCase()} login failed - check apiKey and apiSecret`,
         });
       }
       // Authenticated round-trip — validates accountId/subAccountId too.
       const balance = await testClient.getBalance();
       testEquity = balance.total_equity ?? null;
-      log.info({ userId, equity: testEquity }, 'GRVT credential test: ok');
+      log.info({ userId, exchange, equity: testEquity }, 'credential test: ok');
     } catch (testErr) {
       const msg = (testErr as Error).message || 'unknown error';
-      log.warn({ userId, err: msg }, 'GRVT credential test: failed');
+      log.warn({ userId, exchange, err: msg }, 'credential test: failed');
       return res.status(400).json({
         error: 'credential_test_failed',
         stage: 'account_summary',
-        message: `GRVT API call failed: ${msg}`,
+        message: `${exchange.toUpperCase()} API call failed: ${msg}`,
       });
     }
 
@@ -821,6 +950,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       });
       await gridBotDb.upsertGrvtCredentials({
         user_id: userId,
+        exchange,
         ...encrypted,
         last_test_ok: true,
         last_test_error: null,
@@ -830,10 +960,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       // pick up the new ones. Also rebind the client on any running
       // bots owned by this user so their next tick authenticates
       // with the fresh keys instead of a stale cookie session.
-      invalidateGrvtClient(userId);
+      invalidateGrvtClient(userId, undefined, exchange);
       if (engineOps.rebindGrvtClient) {
         try {
-          await engineOps.rebindGrvtClient(userId);
+          await engineOps.rebindGrvtClient(userId, undefined, exchange);
         } catch (rebindErr) {
           log.warn(
             { userId, err: (rebindErr as Error).message },
@@ -841,8 +971,8 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
           );
         }
       }
-      log.info({ userId }, 'GRVT credentials saved (tested ok)');
-      res.json({ ok: true, equity: testEquity });
+      log.info({ userId, exchange }, 'exchange credentials saved (tested ok)');
+      res.json({ ok: true, equity: testEquity, exchange });
     } catch (err) {
       log.error({ userId, err: (err as Error).message }, 'failed to save GRVT credentials');
       res.status(500).json({
@@ -886,6 +1016,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     res.json(
       rows.map((r) => ({
         id: r.id,
+        exchange: (r as any).exchange ?? 'grvt',
         label: r.label,
         isDefault: !!r.is_default,
         lastTestOk: r.last_test_ok == null ? null : !!r.last_test_ok,
@@ -910,58 +1041,51 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       tradingAddress?: unknown;
       accountId?: unknown;
       subAccountId?: unknown;
+      exchange?: unknown;
       isDefault?: unknown;
     };
+    const exchange = exchangeFromRequest(body.exchange);
     const label = String(body.label ?? '').trim();
     const apiKey = String(body.apiKey ?? '').trim();
     const apiSecret = String(body.apiSecret ?? '').trim();
     const tradingAddress = String(body.tradingAddress ?? '').trim();
-    const accountId = String(body.accountId ?? '').trim();
+    const accountId = String(body.accountId ?? '').trim() || (exchange === 'bitunix' ? 'bitunix' : '');
     // Sub-account optional — defaults to accountId. See note in the
     // default-credentials endpoint above for rationale.
     const subAccountId = String(body.subAccountId ?? '').trim() || accountId;
     const isDefault = body.isDefault === true;
 
-    const errors: string[] = [];
+    const errors = validateCredentialShape({ exchange, apiKey, apiSecret, tradingAddress, accountId });
     if (!label || label.length > 64) errors.push('label is required (max 64 chars)');
-    if (!apiKey) errors.push('apiKey is required');
-    if (!apiSecret) errors.push('apiSecret is required');
-    if (!/^0x[0-9a-fA-F]{64}$/.test(apiSecret)) {
-      errors.push('apiSecret must be a 0x-prefixed 32-byte hex string');
-    }
-    if (!tradingAddress || !/^0x[0-9a-fA-F]{40}$/.test(tradingAddress)) {
-      errors.push('tradingAddress must be a 0x-prefixed Ethereum address');
-    }
-    if (!accountId) errors.push('accountId is required');
     if (errors.length > 0) {
       return res.status(400).json({ error: 'validation_failed', errors });
     }
 
     // Live test: the same login + getBalance round trip the default
     // creds endpoint does. Only persist on success.
-    const plainCreds: GrvtClientCreds = {
+    const plainCreds: ExchangeClientCreds = {
       apiKey, apiSecret, tradingAddress, accountId, subAccountId,
     };
     let testEquity: string | null = null;
     try {
-      const testClient = new GRVTClient(plainCreds);
+      const testClient = createExchangeClient(exchange, plainCreds);
       const loggedIn = await testClient.login();
       if (!loggedIn) {
         return res.status(400).json({
           error: 'credential_test_failed',
           stage: 'login',
-          message: 'GRVT login failed — check apiKey and apiSecret',
+          message: `${exchange.toUpperCase()} login failed - check apiKey and apiSecret`,
         });
       }
       const balance = await testClient.getBalance() as { total_equity?: string };
       testEquity = balance.total_equity ?? null;
     } catch (testErr) {
       const msg = (testErr as Error).message || 'unknown error';
-      log.warn({ userId, err: msg }, 'GRVT sub-account credential test failed');
+      log.warn({ userId, exchange, err: msg }, 'sub-account credential test failed');
       return res.status(400).json({
         error: 'credential_test_failed',
         stage: 'account_summary',
-        message: `GRVT API call failed: ${msg}`,
+        message: `${exchange.toUpperCase()} API call failed: ${msg}`,
       });
     }
 
@@ -971,13 +1095,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       });
       const id = await gridBotDb.createGrvtSubAccount({
         user_id: userId,
+        exchange,
         label,
         ...encrypted,
         is_default: isDefault,
         last_test_ok: true,
       });
-      log.info({ userId, subAccountRowId: id, label }, 'GRVT sub-account created');
-      res.status(201).json({ id, label, isDefault, equity: testEquity });
+      log.info({ userId, exchange, subAccountRowId: id, label }, 'exchange sub-account created');
+      res.status(201).json({ id, label, exchange, isDefault, equity: testEquity });
     } catch (err) {
       log.error(
         { userId, err: (err as Error).message },
@@ -1044,7 +1169,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       });
     }
     await gridBotDb.deleteGrvtSubAccount(id, userId);
-    invalidateGrvtClient(userId, id);
+    invalidateGrvtClient(userId, id, (sub as any).exchange ?? 'grvt');
     log.info({ userId, subAccountRowId: id }, 'GRVT sub-account deleted');
     res.json({ ok: true });
     return;
@@ -1058,7 +1183,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     // showing up after the migration.
     const userId = req.userId!;
     const rows = await dbAll(db, `
-      SELECT id, pair, direction, leverage, lower_price, upper_price, num_grids,
+      SELECT id, exchange, pair, direction, leverage, lower_price, upper_price, num_grids,
              investment_usdt, grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
              status, position_size, avg_entry_price, liquidation_price,
              created_at, updated_at,
@@ -1095,9 +1220,15 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
     await requireBotOwnership(db, id, req.userId!);
 
-    const bot = await dbGet<{ pair: string; status: string }>(
+    const bot = await dbGet<{
+      pair: string;
+      status: string;
+      exchange?: ExchangeId;
+      user_id?: number | null;
+      grvt_sub_account_id?: number | null;
+    }>(
       db,
-      `SELECT pair, status FROM grid_bots WHERE id = ?`,
+      `SELECT pair, status, exchange, user_id, grvt_sub_account_id FROM grid_bots WHERE id = ?`,
       [id]
     );
     if (!bot) return res.status(404).json({ error: 'bot not found' });
@@ -1112,15 +1243,23 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       ORDER BY level_index
     `, [id]);
 
+    const liveClient = await getGrvtClientForBot(
+      bot.user_id ?? req.userId!,
+      bot.grvt_sub_account_id ?? null,
+      gridBotDb,
+      bot.exchange ?? 'grvt'
+    );
+
     // Live data from GRVT (cached 2s).
     const [ticker, position, openOrders] = await Promise.all([
-      cache.getOrFetch(`ticker:${bot.pair}`, 2_000, () => grvtClient.getTicker(bot.pair)),
-      cache.getOrFetch(`position:${bot.pair}`, 2_000, () => grvtClient.getPosition(bot.pair)),
-      cache.getOrFetch(`openOrders:${bot.pair}`, 2_000, () => grvtClient.getOpenOrders(bot.pair))
+      cache.getOrFetch(`ticker:${bot.exchange ?? 'grvt'}:${bot.pair}`, 2_000, () => liveClient.getTicker(bot.pair)),
+      cache.getOrFetch(`position:${req.userId}:${bot.exchange ?? 'grvt'}:${bot.grvt_sub_account_id ?? 'default'}:${bot.pair}`, 2_000, () => liveClient.getPosition(bot.pair)),
+      cache.getOrFetch(`openOrders:${req.userId}:${bot.exchange ?? 'grvt'}:${bot.grvt_sub_account_id ?? 'default'}:${bot.pair}`, 2_000, () => liveClient.getOpenOrders(bot.pair))
     ]);
 
     res.json({
       botId: id,
+      exchange: bot.exchange ?? 'grvt',
       pair: bot.pair,
       status: bot.status,
       levels,
@@ -1134,8 +1273,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
   // ── GET /api/v2/instruments ───────────────────────────────────────
   // Cached 60s — instruments don't change minute-to-minute.
-  router.get('/instruments', asyncHandler(async (_req, res) => {
-    const data = await cache.getOrFetch('instruments', 60_000, () => grvtClient.getInstruments());
+  router.get('/instruments', asyncHandler(async (req, res) => {
+    const exchange = exchangeFromRequest(req.query.exchange);
+    const client = exchange === getDefaultExchangeId() ? grvtClient : createExchangeClient(exchange);
+    const data = await cache.getOrFetch(`instruments:${exchange}`, 60_000, () => client.getInstruments());
     res.json({ instruments: data });
     return;
   }));
@@ -1151,6 +1292,8 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   // we reverse so Lightweight Charts can append in order.
   router.get('/candles', asyncHandler(async (req, res) => {
     const pair = String(req.query.pair ?? 'ETH_USDT_Perp');
+    const exchange = exchangeFromRequest(req.query.exchange);
+    const client = exchange === getDefaultExchangeId() ? grvtClient : createExchangeClient(exchange);
     const interval = String(req.query.interval ?? 'CI_1_H');
     const limitRaw = parseInt(String(req.query.limit ?? '500'), 10);
     const limit = Math.min(Math.max(Number.isFinite(limitRaw) ? limitRaw : 500, 10), 1000);
@@ -1171,9 +1314,9 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
     // Sub-hour intervals refresh more often, so cache them shorter.
     const ttl = interval.endsWith('_M') ? 5_000 : 30_000;
-    const cacheKey = `candles:${pair}:${interval}:${limit}`;
+    const cacheKey = `candles:${exchange}:${pair}:${interval}:${limit}`;
     const candles = await cache.getOrFetch(cacheKey, ttl, async () => {
-      const rows = await grvtClient.getKlines(pair, interval, limit);
+      const rows = await client.getKlines(pair, interval, limit);
       // Reverse to ascending order for the chart (GRVT returns newest first).
       return rows.slice().reverse();
     });
@@ -1184,8 +1327,15 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
   // ── GET /api/v2/balance ───────────────────────────────────────────
   // Cached 2s.
-  router.get('/balance', asyncHandler(async (_req, res) => {
-    const data = await cache.getOrFetch('balance', 2_000, () => grvtClient.getBalance());
+  router.get('/balance', asyncHandler(async (req, res) => {
+    const exchange = exchangeFromRequest(req.query.exchange);
+    const userId = req.userId!;
+    const client = await getGrvtClientForBot(userId, null, gridBotDb, exchange);
+    const data = await cache.getOrFetch(
+      `balance:${userId}:${exchange}:default`,
+      2_000,
+      () => client.getBalance()
+    );
     res.json({ balance: data });
     return;
   }));
@@ -1233,20 +1383,34 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     const limit = Math.min(parseInt(String(req.query.limit ?? '200'), 10) || 200, 1000);
     const offset = Math.max(parseInt(String(req.query.offset ?? '0'), 10) || 0, 0);
     const roundtrips = await dbAll(db, `
-      SELECT id, buy_fill_id, sell_fill_id, buy_price, sell_price, size, profit, created_at
-      FROM paired_roundtrips
-      WHERE bot_id = ?
+      SELECT pr.id, pr.buy_fill_id, pr.sell_fill_id, pr.buy_price, pr.sell_price,
+             pr.size, pr.profit,
+             CASE
+               WHEN pr.created_at NOT GLOB '*[^0-9]*'
+                 THEN datetime(CAST(pr.created_at AS INTEGER) / 1000000000, 'unixepoch')
+               ELSE pr.created_at
+             END AS created_at
+      FROM paired_roundtrips pr
+      JOIN grid_bots b ON b.id = pr.bot_id
+      WHERE pr.bot_id = ?
+        AND (${pairCreatedNsSql}) >= ${botStartNsSql}
       ORDER BY id DESC
       LIMIT ? OFFSET ?
     `, [id, limit, offset]);
     const total = await dbGet<{ c: number; sum: number }>(db, `
-      SELECT COUNT(*) as c, COALESCE(SUM(profit), 0) as sum
-      FROM paired_roundtrips
-      WHERE bot_id = ?
+      SELECT COUNT(*) as c, COALESCE(SUM(pr.profit), 0) as sum
+      FROM paired_roundtrips pr
+      JOIN grid_bots b ON b.id = pr.bot_id
+      WHERE pr.bot_id = ?
+        AND (${pairCreatedNsSql}) >= ${botStartNsSql}
     `, [id]);
     // Net profit = gross - fees (consistent with header "Realized")
     const feeRow = await dbGet<{ f: number }>(db, `
-      SELECT COALESCE(SUM(fee), 0) as f FROM fills_archive WHERE bot_id = ?
+      SELECT COALESCE(SUM(fa.fee), 0) as f
+      FROM fills_archive fa
+      JOIN grid_bots b ON b.id = fa.bot_id
+      WHERE fa.bot_id = ?
+        AND CAST(fa.event_time AS INTEGER) >= ${botStartNsSql}
     `, [id]);
     const netProfit = (total?.sum ?? 0) - (feeRow?.f ?? 0);
     res.json({ roundtrips, count: total?.c ?? 0, totalProfit: netProfit });
@@ -1280,10 +1444,12 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       fee: number;
       created_at: string;
     }>(db, `
-      SELECT id, fill_id, event_time, is_buyer, price, size, fee, created_at
-      FROM fills_archive
-      WHERE bot_id = ?
-      ORDER BY event_time DESC
+      SELECT fa.id, fa.fill_id, fa.event_time, fa.is_buyer, fa.price, fa.size, fa.fee, fa.created_at
+      FROM fills_archive fa
+      JOIN grid_bots b ON b.id = fa.bot_id
+      WHERE fa.bot_id = ?
+        AND CAST(fa.event_time AS INTEGER) >= ${botStartNsSql}
+      ORDER BY CAST(fa.event_time AS INTEGER) DESC
       LIMIT ? OFFSET ?
     `, [id, limit, offset]);
 
@@ -1313,11 +1479,13 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       max_fee: number | null;
     }>(db, `
       SELECT COUNT(*) AS count,
-             COALESCE(SUM(fee), 0) AS sum_fee,
-             MIN(fee) AS min_fee,
-             MAX(fee) AS max_fee
-      FROM fills_archive
-      WHERE bot_id = ?
+             COALESCE(SUM(fa.fee), 0) AS sum_fee,
+             MIN(fa.fee) AS min_fee,
+             MAX(fa.fee) AS max_fee
+      FROM fills_archive fa
+      JOIN grid_bots b ON b.id = fa.bot_id
+      WHERE fa.bot_id = ?
+        AND CAST(fa.event_time AS INTEGER) >= ${botStartNsSql}
     `, [id]);
 
     const sumFee = row?.sum_fee ?? 0;
@@ -1363,40 +1531,20 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid bot id' });
     await requireBotOwnership(db, id, req.userId!);
 
-    // SOURCE OF TRUTH: paired_roundtrips scoped by bot_id.
-    // Fee data from fills_archive (also scoped by bot_id).
-    const rtStats = await dbGet<{ profit: number; count: number; earliest: string; latest: string }>(db, `
-      SELECT COALESCE(SUM(profit), 0) as profit,
-             COUNT(*) as count,
-             MIN(created_at) as earliest,
-             MAX(created_at) as latest
-      FROM paired_roundtrips
-      WHERE bot_id = ?
+    const bot = await dbGet<{ direction: 'long' | 'short' }>(db, `
+      SELECT direction FROM grid_bots WHERE id = ?
     `, [id]);
 
-    const feeStats = await dbGet<{ totalFees: number; fillCount: number }>(db, `
-      SELECT COALESCE(SUM(fee), 0) as totalFees,
-             COUNT(*) as fillCount
-      FROM fills_archive
-      WHERE bot_id = ?
+    const fills = await dbAll<ScopedFill>(db, `
+      SELECT fa.fill_id, fa.event_time, fa.is_buyer, fa.price, fa.size, fa.fee, fa.created_at
+      FROM fills_archive fa
+      JOIN grid_bots b ON b.id = fa.bot_id
+      WHERE fa.bot_id = ?
+        AND CAST(fa.event_time AS INTEGER) >= ${botStartNsSql}
+      ORDER BY CAST(fa.event_time AS INTEGER) ASC
     `, [id]);
 
-    const gridProfit = rtStats?.profit ?? 0;
-    const totalFees = feeStats?.totalFees ?? 0;
-    const pairs = rtStats?.count ?? 0;
-
-    res.json({
-      gridProfit,                              // gross trade-pair profit
-      totalFees,                               // signed; negative = rebate
-      netGridProfit: gridProfit - totalFees,   // grid profit AFTER fees
-      pairs,                                   // matched grid round trips
-      avgPerPair: pairs > 0 ? gridProfit / pairs : 0,
-      fillCount: feeStats?.fillCount ?? 0,
-      unpairedBuys: 0,                         // not computed from roundtrips
-      unpairedSells: 0,
-      firstFillAt: rtStats?.earliest ?? null,
-      lastFillAt: rtStats?.latest ?? null,
-    });
+    res.json(computeRealizedFromFills(fills, bot?.direction ?? 'long'));
     return;
   }));
 
@@ -1449,14 +1597,26 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       return res.status(400).json({ error: 'invalid_body', message: 'slippagePct must be in (0, 5]' });
     }
 
-    const bot = await dbGet<{ id: number; pair: string }>(db, `
-      SELECT id, pair FROM grid_bots WHERE id = ?
+    const bot = await dbGet<{
+      id: number;
+      pair: string;
+      user_id: number | null;
+      exchange?: ExchangeId;
+      grvt_sub_account_id?: number | null;
+    }>(db, `
+      SELECT id, pair, user_id, exchange, grvt_sub_account_id FROM grid_bots WHERE id = ?
     `, [botId]);
     if (!bot) return res.status(404).json({ error: 'bot not found' });
+    const liveClient = await getGrvtClientForBot(
+      bot.user_id ?? req.userId!,
+      bot.grvt_sub_account_id ?? null,
+      gridBotDb,
+      bot.exchange ?? 'grvt'
+    );
 
     // Aggressive limit pricing — same pattern the engine's closeBot uses
     // (0.5% on the worse side of market, GTC, executes ~immediately).
-    const ticker = await (grvtClient as unknown as { getTicker(p: string): Promise<{ last_price: string }> }).getTicker(bot.pair);
+    const ticker = await liveClient.getTicker(bot.pair);
     const lastPrice = parseFloat(ticker.last_price);
     if (!Number.isFinite(lastPrice) || lastPrice <= 0) {
       return res.status(502).json({ error: 'ticker_unavailable' });
@@ -1468,21 +1628,14 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         ? Math.floor(lastPrice * (1 - slip) * 100) / 100  // 0.5% below
         : Math.ceil(lastPrice * (1 + slip) * 100) / 100;  // 0.5% above
 
-    const subAccountId = process.env.GRVT_TRADING_ACCOUNT_ID;
-    if (!subAccountId) {
-      return res.status(500).json({ error: 'sub_account_id_missing' });
-    }
-
     log.warn(
       { botId, side, size, lastPrice, aggressivePrice },
       'admin manual-trade requested'
     );
 
     try {
-      const order = await (grvtClient as unknown as {
-        createOrder(p: Record<string, unknown>, allowMarket?: boolean): Promise<{ order_id: string }>;
-      }).createOrder({
-        sub_account_id: subAccountId,
+      const order = await liveClient.createOrder({
+        sub_account_id: liveClient.subAccountId,
         instrument: bot.pair,
         size: (Math.floor(size * 10000) / 10000).toString(),
         price: aggressivePrice.toString(),
@@ -1535,8 +1688,8 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       return res.status(400).json({ error: 'botId query param required' });
     }
 
-    const bot = await dbGet<{ id: number; pair: string }>(db, `
-      SELECT id, pair FROM grid_bots WHERE id = ?
+    const bot = await dbGet<{ id: number; pair: string; created_at: string }>(db, `
+      SELECT id, pair, created_at FROM grid_bots WHERE id = ?
     `, [botId]);
     if (!bot) return res.status(404).json({ error: 'bot not found' });
 
@@ -1545,6 +1698,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       50
     );
     const instrument = bot.pair;
+    const botCreatedAtMs = parseDbTimestampMs(bot.created_at);
     const t0 = Date.now();
 
     let totalFetched = 0;
@@ -1572,6 +1726,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         const eventTime = String(f.event_time ?? '');
         if (!eventTime) continue;
         totalFetched++;
+        const eventMs = eventTimeNsToMs(eventTime);
+        if (botCreatedAtMs !== null && eventMs !== null && eventMs < botCreatedAtMs) {
+          continue;
+        }
         const result = await dbRun(db, `
           INSERT OR IGNORE INTO fills_archive
             (fill_id, event_time, is_buyer, price, size, fee, created_at, bot_id, instrument)
@@ -1607,11 +1765,13 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
       max_fee: number;
     }>(db, `
       SELECT COUNT(*) AS count,
-             COALESCE(SUM(fee), 0) AS sum_fee,
-             MIN(fee) AS min_fee,
-             MAX(fee) AS max_fee
-      FROM fills_archive
-      WHERE bot_id = ?
+             COALESCE(SUM(fa.fee), 0) AS sum_fee,
+             MIN(fa.fee) AS min_fee,
+             MAX(fa.fee) AS max_fee
+      FROM fills_archive fa
+      JOIN grid_bots b ON b.id = fa.bot_id
+      WHERE fa.bot_id = ?
+        AND CAST(fa.event_time AS INTEGER) >= ${botStartNsSql}
     `, [botId]);
     res.json({
       ok: true,
@@ -1708,6 +1868,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   router.post('/bots/validate', asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as Partial<{
       pair: string;
+      exchange: ExchangeId;
       direction: 'long' | 'short';
       lower_price: number;
       upper_price: number;
@@ -1717,6 +1878,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     }>;
 
     const errors: string[] = [];
+    const exchange = exchangeFromRequest((body as any).exchange);
     const pair = String(body.pair ?? '').trim();
     if (!pair) errors.push('pair is required');
     const direction = body.direction === 'short' ? 'short' : 'long';
@@ -1760,20 +1922,15 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     // position by 0.17 ETH on a 6-min run. Single source of truth now.
     const spacing = (upper - lower) / (grids - 1);
     const notional = investment * leverage;
-    const ORDER_ALLOC = 0.75;
     const midPrice = (upper + lower) / 2;
-    const effCap = investment * leverage * ORDER_ALLOC;
-    const minSize = pair === 'ETH_USDT_Perp' ? 0.01 : 0.001;
-    let qtyPerLevel = Math.max(
-      Math.ceil((effCap / grids / midPrice) * 100) / 100,
-      0.03
+    const qtyPerLevel = computeQtyPerLevelForPair(
+      investment,
+      leverage,
+      grids,
+      midPrice,
+      pair,
+      lower
     );
-    // Floor on min notional at the lower price (safety net; usually no-op).
-    const minNotional = pair === 'ETH_USDT_Perp' ? 20 : 100;
-    while (qtyPerLevel * lower < minNotional) {
-      qtyPerLevel += minSize;
-    }
-    qtyPerLevel = Math.round(qtyPerLevel * 100) / 100;
     const profitPerRoundTrip = qtyPerLevel * spacing;
 
     // Estimated liquidation: simplified — actual depends on funding/fees.
@@ -1790,6 +1947,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
     res.json({
       valid: true,
+      exchange,
       pair,
       direction,
       input: { lower, upper, grids, investment, leverage },
@@ -1822,6 +1980,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
   router.post('/bots', asyncHandler(async (req, res) => {
     const body = (req.body ?? {}) as Partial<{
       pair: string;
+      exchange: ExchangeId;
       direction: 'long' | 'short';
       lower_price: number;
       upper_price: number;
@@ -1840,6 +1999,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
     }>;
 
     const errors: string[] = [];
+    const exchange = exchangeFromRequest((body as any).exchange);
     const pair = String(body.pair ?? '').trim();
     if (!pair) errors.push('pair is required');
     const direction = body.direction === 'short' ? 'short' : 'long';
@@ -1915,6 +2075,12 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
             message: 'Sub-account not found',
           });
         }
+        if (normalizeExchange((sub as any).exchange ?? 'grvt') !== exchange) {
+          return res.status(400).json({
+            error: 'invalid_sub_account',
+            message: 'Sub-account exchange does not match bot exchange',
+          });
+        }
         grvtSubAccountId = id;
       }
 
@@ -1928,9 +2094,10 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         `SELECT COUNT(*) as c FROM grid_bots
          WHERE COALESCE(user_id, 1) = ?
            AND pair = ?
+           AND COALESCE(exchange, 'grvt') = ?
            AND COALESCE(grvt_sub_account_id, -1) = COALESCE(?, -1)
            AND status IN ('running', 'paused')`,
-        [userId, pair, grvtSubAccountId]
+        [userId, pair, exchange, grvtSubAccountId]
       );
       if (existing && existing.c > 0) {
         return res.status(409).json({
@@ -1941,6 +2108,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
 
       const botId = await engineOps.createBot({
         userId,
+        exchange,
         pair,
         direction,
         leverage,
@@ -1952,7 +2120,7 @@ Al hacer click en "Leí y acepto los términos de arriba" y crear una cuenta, co
         activeWindowSize: virtualEnabled ? activeWindowSize : undefined,
         grvtSubAccountId,
       });
-      log.info({ botId, userId, pair, direction, leverage, grids }, 'bot created (paused)');
+      log.info({ botId, userId, exchange, pair, direction, leverage, grids }, 'bot created (paused)');
 
       // Persist per-bot risk acceptance if the dashboard sent the
       // exact text + version it showed. The text is hashed and the

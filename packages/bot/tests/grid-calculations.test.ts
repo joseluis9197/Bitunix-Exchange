@@ -54,6 +54,9 @@ const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
 vi.mock('../src/api/client.js', () => ({
   grvtClient: mockGrvtClient,
   GRVTClient: vi.fn(),
+  getDefaultExchangeId: () => 'grvt',
+  normalizeExchange: (value: unknown) => (value === 'bitunix' ? 'bitunix' : 'grvt'),
+  createExchangeClient: vi.fn(() => mockGrvtClient),
   getInstrumentSpec: (pair: string) => {
     if (pair === 'BTC_USDT_Perp') return { min_size: 0.001, min_notional: 100, tick_size: 0.1 };
     return { min_size: 0.01, min_notional: 20, tick_size: 0.01 };
@@ -62,6 +65,7 @@ vi.mock('../src/api/client.js', () => ({
 }));
 
 vi.mock('../src/api/grvt-client-factory.js', () => ({
+  getGrvtClientForBot: vi.fn().mockResolvedValue(mockGrvtClient),
   getGrvtClientForUser: vi.fn().mockResolvedValue(mockGrvtClient),
   invalidateGrvtClient: vi.fn(),
 }));
@@ -258,7 +262,9 @@ describe('GridEngine.calculateGridLevels', () => {
     // inv=500, lev=2, ORDER_ALLOC=0.75
     // effCap = 500*2*0.75 = 750
     // midPrice = (1800+2400)/2 = 2100
-    // qty = ceil((750/10/2100)*100)/100 = ceil(0.03571*100)/100 = ceil(3.571)/100 = 4/100 = 0.04
+    // budget qty = floor((750/10/2100)*100)/100 = floor(3.571)/100 = 0.03
+    // min-notional qty = ceil((20/1800)*100)/100 = ceil(1.111)/100 = 0.02
+    // quantity per grid = max(step, min-notional qty, budget qty) = 0.03
     const result = await engine.calculateGridLevels({
       pair: 'ETH_USDT_Perp',
       direction: 'long',
@@ -269,7 +275,7 @@ describe('GridEngine.calculateGridLevels', () => {
       investmentUSDT: 500,
     });
 
-    expect(result.quantityPerGrid).toBe(0.04);
+    expect(result.quantityPerGrid).toBe(0.03);
     // All levels should have the same qty
     for (const level of result.gridLevels) {
       expect(level.quantity).toBe(result.quantityPerGrid);
@@ -307,7 +313,7 @@ describe('GridEngine.calculateGridLevels', () => {
     ).rejects.toThrow(/fuera del rango/);
   });
 
-  it('qty floors at 0.03 for tiny investments', async () => {
+  it('qty respects exchange min-notional floor for tiny investments', async () => {
     const result = await engine.calculateGridLevels({
       pair: 'ETH_USDT_Perp',
       direction: 'long',
@@ -318,7 +324,7 @@ describe('GridEngine.calculateGridLevels', () => {
       investmentUSDT: 100, // very small
     });
 
-    expect(result.quantityPerGrid).toBeGreaterThanOrEqual(0.03);
+    expect(result.quantityPerGrid).toBe(0.02);
   });
 
   it('liquidation price is included in result', async () => {

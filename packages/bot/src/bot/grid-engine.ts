@@ -1,11 +1,19 @@
 // Grid Trading Engine - Fase 3
 // Lógica completa de grid trading con safeguards para dinero real
 
-import { grvtClient, type GRVTClient, getInstrumentSpec } from '../api/client.js';
+import {
+  grvtClient,
+  getDefaultExchangeId,
+  normalizeExchange,
+  type ExchangeId,
+  type TradingClient,
+  getInstrumentSpec,
+} from '../api/client.js';
 import { getGrvtClientForBot, invalidateGrvtClient } from '../api/grvt-client-factory.js';
 import { db } from '../database/db.js';
 import type { GridBot, GridLevel, OrderRecord } from '../database/db.js';
 import { childLogger } from '../server/logger.js';
+import { computeQtyPerLevelForPair } from './quantity.js';
 import { EventEmitter } from 'events';
 
 const log = childLogger('engine');
@@ -16,6 +24,7 @@ export interface GridConfig {
   // (admin scripts, tests) can omit it and the bot defaults to
   // user 1 (the owner).
   userId?: number;
+  exchange?: ExchangeId;
   pair: string;
   direction: 'long' | 'short';
   leverage: number;
@@ -101,19 +110,23 @@ export function computeQtyPerLevel(
   midPrice: number,
   pair: string = 'ETH_USDT_Perp'
 ): number {
-  const ORDER_ALLOC = 0.75;
-  const effCap = investmentUsdt * leverage * ORDER_ALLOC;
-  const { min_size: minSize, min_notional: minNotional } = getInstrumentSpec(pair);
-  let qty = Math.max(
-    Math.ceil((effCap / numGrids / midPrice) * 100) / 100,
-    0.03
-  );
-  // Ensure min notional at lowest likely price
-  
-  while (qty * midPrice * 0.8 < minNotional) {
-    qty += minSize;
+  return computeQtyPerLevelForPair(investmentUsdt, leverage, numGrids, midPrice, pair);
+}
+
+function parseDbTimestampMs(value?: string | null): number | null {
+  if (!value) return null;
+  const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function eventTimeNsToMs(value: string): number | null {
+  try {
+    return Number(BigInt(value) / 1_000_000n);
+  } catch {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.floor(n / 1_000_000) : null;
   }
-  return Math.round(qty * 100) / 100;
 }
 
 /**
@@ -426,21 +439,18 @@ export class GridEngine extends EventEmitter {
     bot: {
       id?: number;
       user_id?: number | null | undefined;
+      exchange?: ExchangeId | string | null | undefined;
       grvt_sub_account_id?: number | null;
     }
-  ): Promise<GRVTClient> {
+  ): Promise<TradingClient> {
+    const exchange = normalizeExchange(bot.exchange ?? getDefaultExchangeId());
     if (bot.user_id != null) {
-      try {
-        return await getGrvtClientForBot(
-          bot.user_id,
-          bot.grvt_sub_account_id ?? null,
-          db as any
-        );
-      } catch (err) {
-        log.warn(
-          `⚠️  Per-user GRVT client lookup failed for user ${bot.user_id} (bot ${bot.id ?? '?'}): ${(err as Error).message}. Falling back to singleton.`
-        );
-      }
+      return await getGrvtClientForBot(
+        bot.user_id,
+        bot.grvt_sub_account_id ?? null,
+        db as any,
+        exchange
+      );
     }
     return grvtClient;
   }
@@ -454,13 +464,15 @@ export class GridEngine extends EventEmitter {
    */
   async rebindGrvtClient(
     userId: number,
-    subAccountId?: number | null
+    subAccountId?: number | null,
+    exchange?: ExchangeId | string | null
   ): Promise<void> {
-    invalidateGrvtClient(userId, subAccountId);
+    invalidateGrvtClient(userId, subAccountId, exchange);
     const affected: number[] = [];
     for (const [botId, instance] of this.bots) {
       const bot = instance.getBot();
       if (bot.user_id !== userId) continue;
+      if (exchange != null && normalizeExchange(bot.exchange ?? 'grvt') !== normalizeExchange(exchange)) continue;
       // If a specific sub-account was given, only rebind bots that
       // route through it. undefined = "all bots for this user" (used
       // by default-creds rotation).
@@ -474,7 +486,8 @@ export class GridEngine extends EventEmitter {
         const fresh = await getGrvtClientForBot(
           userId,
           bot.grvt_sub_account_id ?? null,
-          db as any
+          db as any,
+          bot.exchange ?? 'grvt'
         );
         instance.rebindClient(fresh);
         affected.push(botId);
@@ -692,6 +705,7 @@ export class GridEngine extends EventEmitter {
         // Default to user 1 (owner) when caller omits — admin
         // scripts and legacy code paths get the right behavior.
         user_id: config.userId ?? 1,
+        exchange: config.exchange ?? getDefaultExchangeId(),
         pair: config.pair,
         direction: config.direction,
         leverage: config.leverage,
@@ -1081,7 +1095,8 @@ export class GridEngine extends EventEmitter {
               price: aggressivePrice.toString(),
               side: closeSide,
               type: 'limit',
-              time_in_force: 'gtc'
+              time_in_force: 'gtc',
+              metadata: `close_${botId}_${Date.now()}`,
             }, true);
           } catch (orderErr) {
             log.error({ botId, attempt, err: (orderErr as Error).message }, 'close-order placement failed');
@@ -1253,7 +1268,11 @@ export class GridEngine extends EventEmitter {
   async calculateGridLevels(config: GridConfig): Promise<GridCalculation> {
     // Multi-tenant: route ticker + liq-price lookups through the
     // owner's GRVT client so grid previews don't leak between users.
-    const client = await this.getClientForBot({ user_id: config.userId });
+    const client = await this.getClientForBot({
+      user_id: config.userId,
+      exchange: config.exchange,
+      grvt_sub_account_id: config.grvtSubAccountId ?? null,
+    });
     // Obtener precio actual
     const ticker = await client.getTicker(config.pair);
     const currentPrice = parseFloat(ticker.last_price);
@@ -1276,33 +1295,26 @@ export class GridEngine extends EventEmitter {
     // price. Then monitor replaced at the canonical 0.05. Position
     // drifted by 0.17 ETH (~$377) before the user closed.
     //
-    // Formula matches db.createBot() line ~470:
+    // Formula matches db.createBot():
     //   ORDER_ALLOC = 0.75 (15% safety on top of leverage cap, 10% extra)
     //   effCap = inv * leverage * ORDER_ALLOC
     //   midPrice = (lower + upper) / 2  ← uses range mid, NOT live price
-    //   qty = ceil((effCap / numGrids / midPrice) * 100) / 100
-    //   floor 0.03
-    const ORDER_ALLOC = 0.75;
     const midPrice = (config.lowerPrice + config.upperPrice) / 2;
-    const effCap = config.investmentUSDT * config.leverage * ORDER_ALLOC;
-    const { min_notional: minNotional, min_size: minSize } = getInstrumentSpec(config.pair);
-    
-    let canonicalQty = Math.max(
-      Math.ceil((effCap / config.numGrids / midPrice) * 100) / 100,
-      0.03
+    const effCap = config.investmentUSDT * config.leverage * 0.75;
+    const canonicalQty = computeQtyPerLevelForPair(
+      config.investmentUSDT,
+      config.leverage,
+      config.numGrids,
+      midPrice,
+      config.pair,
+      config.lowerPrice
     );
-    // Ensure min notional at the LOWEST price (worst-case for buy levels):
-    // a 0.03 qty at $1800 = $54 which is well above $20, so this is
-    // usually a no-op, but keep it as defense in depth.
-    while (canonicalQty * config.lowerPrice < minNotional) {
-      canonicalQty += minSize;
-    }
-    canonicalQty = Math.round(canonicalQty * 100) / 100;
+    const baseAsset = config.pair.split('_')[0] || 'BASE';
 
     log.info(`🧮 Grid calculation: ${config.numGrids} grids = ${config.numGrids + 1} niveles`);
     log.info(`🧮 Rango: $${config.lowerPrice} - $${config.upperPrice}`);
     log.info(`🧮 Spacing: $${spacing.toFixed(2)} por nivel`);
-    log.info(`🧮 Canonical qty per level: ${canonicalQty} ETH (effCap $${effCap.toFixed(2)} / ${config.numGrids} grids / $${midPrice} mid)`);
+    log.info(`🧮 Canonical qty per level: ${canonicalQty} ${baseAsset} (effCap $${effCap.toFixed(2)} / ${config.numGrids} grids / $${midPrice} mid)`);
 
     // Generate level 0..numGrids = numGrids+1 levels. Every level
     // gets the SAME canonicalQty so the grid is constant-quantity.
@@ -1438,6 +1450,7 @@ export class GridEngine extends EventEmitter {
     
     return allBots.map(bot => ({
       id: bot.id,
+      exchange: bot.exchange ?? 'grvt',
       pair: bot.pair,
       direction: bot.direction,
       leverage: bot.leverage,
@@ -2081,12 +2094,17 @@ export class GridEngine extends EventEmitter {
       // client-side instead. Discovered 2026-05-03 — bot 44 (ETH) had
       // ingested 291 SOL fills from bot 48 across 8 days.
       const ownFills = allFills.filter((f) => f.instrument === instrument);
+      const botCreatedAtMs = parseDbTimestampMs(bot.created_at);
 
       let added = 0;
       let feeSum = 0;
       for (const f of ownFills) {
         const eventTime = String(f.event_time ?? '');
         if (!eventTime) continue;
+        const eventMs = eventTimeNsToMs(eventTime);
+        if (botCreatedAtMs !== null && eventMs !== null && eventMs < botCreatedAtMs) {
+          continue;
+        }
         const fee = parseFloat(f.fee ?? '0');
         const inserted = await db.insertFillArchive({
           fill_id: eventTime,
@@ -2144,21 +2162,21 @@ export class GridBotInstance {
   // getClientForBot(). Falls back to the module-level `grvtClient`
   // singleton only for legacy bots with no user_id (the factory
   // couldn't resolve a per-user client).
-  private injectedClient: GRVTClient | null = null;
+  private injectedClient: TradingClient | null = null;
 
-  constructor(bot: GridBot, client?: GRVTClient) {
+  constructor(bot: GridBot, client?: TradingClient) {
     this.bot = bot;
     this.injectedClient = client ?? null;
   }
 
   /** Accessor for the GRVT client this bot should use. Falls back
    *  to the legacy singleton if no per-user client was injected. */
-  private get grvt(): GRVTClient {
+  private get grvt(): TradingClient {
     return this.injectedClient ?? grvtClient;
   }
 
   /** Replace the injected client (e.g. when user updates creds). */
-  rebindClient(client: GRVTClient): void {
+  rebindClient(client: TradingClient): void {
     this.injectedClient = client;
   }
 
@@ -2225,7 +2243,14 @@ export class GridBotInstance {
     const rangeMin = levels.length > 0 ? levels[0]!.price : 1800;
     const rangeMax = levels.length > 0 ? levels[levels.length - 1]!.price : 2450;
     const midPrice = (rangeMin + rangeMax) / 2;
-    return Math.max(Math.ceil((effCap / (this.bot.num_grids || 94) / midPrice) * 100) / 100, 0.03);
+    return computeQtyPerLevelForPair(
+      this.bot.investment_usdt || 670,
+      this.bot.leverage || 10,
+      this.bot.num_grids || 94,
+      midPrice,
+      this.bot.pair,
+      rangeMin
+    );
   }
 
   getActiveOrderCount(): number {
@@ -2364,12 +2389,13 @@ export class GridBotInstance {
       return;
     }
 
-    // Calcular cantidad total de ETH necesaria
+    // Calcular cantidad total necesaria del activo base
     const totalQuantityNeeded = sellLevelsAbove.reduce((sum, level) => sum + level.quantity, 0);
     const notionalUSDT = totalQuantityNeeded * currentPrice;
+    const baseAsset = this.bot.pair.split('_')[0] || 'BASE';
 
     log.info(`💰 [DEBUG] Bot ${this.bot.id}: Niveles SELL arriba: ${sellLevelsAbove.length}`);
-    log.info(`💰 [DEBUG] Bot ${this.bot.id}: Cantidad total necesaria: ${totalQuantityNeeded} ETH`);
+    log.info(`💰 [DEBUG] Bot ${this.bot.id}: Cantidad total necesaria: ${totalQuantityNeeded} ${baseAsset}`);
     log.info(`💰 [DEBUG] Bot ${this.bot.id}: Notional USDT: $${notionalUSDT.toFixed(2)}`);
 
     // Validar min_notional
@@ -2402,7 +2428,7 @@ export class GridBotInstance {
       const safeBuyPrice = Math.floor(askPrice * 1.001 * 100) / 100; // 0.1% arriba del ask, rounded to tick
 
       const order = await this.grvt.createOrder({
-        sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
+        sub_account_id: this.grvt.subAccountId,
         instrument: this.bot.pair,
         size: (Math.floor(totalQuantityNeeded * 100) / 100).toString(), // Round to 0.01
         price: safeBuyPrice.toString(),
@@ -2427,7 +2453,7 @@ export class GridBotInstance {
         const totalFilled = initialFills.reduce((sum, fill) => sum + parseFloat(fill.size), 0);
         const avgPrice = initialFills.reduce((sum, fill) => sum + parseFloat(fill.price) * parseFloat(fill.size), 0) / totalFilled;
 
-        log.info(`✅ [REAL] Bot ${this.bot.id}: Compra inicial ejecutada: ${totalFilled} ETH @ $${avgPrice.toFixed(2)}`);
+        log.info(`✅ [REAL] Bot ${this.bot.id}: Compra inicial ejecutada: ${totalFilled} ${baseAsset} @ $${avgPrice.toFixed(2)}`);
 
         // Actualizar posición del bot
         await db.updateBot(this.bot.id, {
@@ -2651,8 +2677,13 @@ export class GridBotInstance {
       // 💰 MODO REAL: Colocar orden en GRVT usando nuevo formato
       log.info(`💰 [DEBUG] REAL MODE - Enviando orden a GRVT con nuevo createOrder...`);
       
+      const isClosingGridOrder =
+        (this.bot.direction === 'long' && level.side === 'sell') ||
+        (this.bot.direction === 'short' && level.side === 'buy');
+      const metadataPrefix = isClosingGridOrder ? 'close_grid' : 'grid';
+
       const order = await this.grvt.createOrder({
-        sub_account_id: process.env.GRVT_TRADING_ACCOUNT_ID!,
+        sub_account_id: this.grvt.subAccountId,
         instrument: this.bot.pair,
         size: level.quantity.toString(),
         price: level.price.toString(),
@@ -2660,7 +2691,7 @@ export class GridBotInstance {
         type: 'limit',
         time_in_force: 'gtc',
         post_only: true,
-        metadata: `grid_${this.bot.id}_${level.level_index}`
+        metadata: `${metadataPrefix}_${this.bot.id}_${level.level_index}`
       });
 
       log.info({ order }, 'REAL MODE - Respuesta de GRVT createOrder');
@@ -2687,7 +2718,7 @@ export class GridBotInstance {
       }
 
       // Guardar realOrderId en database, NO order.order_id
-      const uniqueOrderId = order.metadata || `grid_${this.bot.id}_${level.level_index}_${Date.now()}`;
+      const uniqueOrderId = order.metadata || `${metadataPrefix}_${this.bot.id}_${level.level_index}_${Date.now()}`;
       log.info(`📝 [DEBUG] REAL MODE - Guardando orden en DB con real order_id: ${realOrderId}`);
       await db.createOrder({
         bot_id: this.bot.id,
@@ -3470,21 +3501,9 @@ export class GridBotInstance {
   }
 
   /**
-   * Real grid profit for THIS bot, computed by spread-pair matching
-   * its own fills (filtered by bot_id from fills_archive).
-   *
-   * Bot 44 hit a leak on 2026-04-08: the previous implementation
-   * called this.grvt.getFillHistory(1000) which returns the entire
-   * sub-account history with NO bot attribution, then ran spread-pair
-   * over the lot. Result: bot 44 (running 6 minutes, 5 fills) inherited
-   * bot 42's full $76 of grid profit. The fills_archive table has
-   * proper bot_id attribution (added in Phase B), so we read from
-   * there instead.
-   *
-   * Spread-pair details: pair each SELL with the unmatched BUY whose
-   * price is between $3 and $20 lower (one grid spacing window).
-   * MUST match v2-router /realized-summary so the dashboard and the
-   * stored bot.grid_profit_usdt agree.
+   * Realized grid profit for this bot, computed by FIFO matching only
+   * fills that happened after the bot was created. This keeps old account
+   * history on the same symbol from leaking into a new bot's stats.
    */
   private async calculateRealGridProfit(): Promise<number | null> {
     try {
@@ -3492,59 +3511,69 @@ export class GridBotInstance {
 
       if (!fills || fills.length === 0) return 0;
 
-      // Spread-pair window scaled to this bot's grid spacing. The old
-      // hardcoded `(3, 20)` was tuned for ETH (spacing ~$6) and silently
-      // rejected every legit pair on smaller-priced instruments — the
-      // SOL bot had 0 paired roundtrips despite hundreds of fills
-      // because $0.25 spreads never fell into (3, 20). Use 0.5x to 3x
-      // spacing so adjacent-grid pairs match on any instrument.
-      const spacing = (this.bot.upper_price - this.bot.lower_price) / this.bot.num_grids;
-      const spreadMin = spacing * 0.5;
-      const spreadMax = spacing * 3;
-
       let totalFees = 0;
       let grossProfit = 0;
       let pairs = 0;
-      const pendingBuys: Array<{ fill_id: string; price: number; size: number; event_time: string }> = [];
+      const openLots: Array<{ fill_id: string; price: number; size: number; event_time: string }> = [];
+      const matchedPairs: Array<{
+        bot_id: number;
+        buy_fill_id: string;
+        sell_fill_id: string;
+        buy_price: number;
+        sell_price: number;
+        size: number;
+        profit: number;
+        created_at: string;
+      }> = [];
       let totalBuys = 0;
       let totalSells = 0;
+      const EPS = 1e-9;
 
       for (const f of fills) {
         totalFees += f.fee;
+        const isBuy = f.is_buyer === 1;
+        if (isBuy) totalBuys++;
+        else totalSells++;
 
-        if (f.is_buyer) {
-          totalBuys++;
-          pendingBuys.push({ fill_id: f.fill_id, price: f.price, size: f.size, event_time: f.event_time });
-        } else {
-          totalSells++;
-          let bestIdx = -1;
-          let bestSpread = Infinity;
-          pendingBuys.forEach((b, i) => {
-            const spread = f.price - b.price;
-            if (spread > spreadMin && spread < spreadMax && spread < bestSpread) {
-              bestIdx = i;
-              bestSpread = spread;
-            }
-          });
-          if (bestIdx >= 0) {
-            const b = pendingBuys[bestIdx]!;
-            const profit = (f.price - b.price) * f.size;
-            grossProfit += profit;
-            pairs++;
-            pendingBuys.splice(bestIdx, 1);
-            // Persist to paired_roundtrips (idempotent via INSERT OR IGNORE)
-            db.insertPairedRoundtrip({
-              bot_id: this.bot.id,
-              buy_fill_id: b.fill_id,
-              sell_fill_id: f.fill_id,
-              buy_price: b.price,
-              sell_price: f.price,
-              size: f.size,
-              profit,
-              created_at: f.event_time,
-            }).catch(() => {}); // fire-and-forget, idempotent
-          }
+        const opensPosition =
+          (this.bot.direction === 'long' && isBuy) ||
+          (this.bot.direction === 'short' && !isBuy);
+
+        if (opensPosition) {
+          openLots.push({ fill_id: f.fill_id, price: f.price, size: f.size, event_time: f.event_time });
+          continue;
         }
+
+        let remaining = f.size;
+        while (remaining > EPS && openLots.length > 0) {
+          const lot = openLots[0]!;
+          const matched = Math.min(lot.size, remaining);
+          const buyFill = this.bot.direction === 'long' ? lot : f;
+          const sellFill = this.bot.direction === 'long' ? f : lot;
+          const profit = (sellFill.price - buyFill.price) * matched;
+
+          grossProfit += profit;
+          pairs++;
+          matchedPairs.push({
+            bot_id: this.bot.id,
+            buy_fill_id: buyFill.fill_id,
+            sell_fill_id: sellFill.fill_id,
+            buy_price: buyFill.price,
+            sell_price: sellFill.price,
+            size: matched,
+            profit,
+            created_at: f.event_time,
+          });
+
+          lot.size -= matched;
+          remaining -= matched;
+          if (lot.size <= EPS) openLots.shift();
+        }
+      }
+
+      await db.clearPairedRoundtripsForBot(this.bot.id);
+      for (const pair of matchedPairs) {
+        await db.insertPairedRoundtrip(pair);
       }
 
       const netProfit = grossProfit - totalFees;

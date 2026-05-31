@@ -17,6 +17,7 @@ import { useConfirm } from './primitives/confirm-dialog';
 import { useT } from '@/i18n';
 
 interface AddState {
+  exchange: 'grvt' | 'bitunix';
   label: string;
   apiKey: string;
   apiSecret: string;
@@ -27,6 +28,7 @@ interface AddState {
 }
 
 const INITIAL_ADD: AddState = {
+  exchange: 'bitunix',
   label: '',
   apiKey: '',
   apiSecret: '',
@@ -35,6 +37,8 @@ const INITIAL_ADD: AddState = {
   subAccountId: '',
   isDefault: false,
 };
+
+const BITUNIX_REFERRAL_URL = 'https://www.bitunix.com/register?inviteCode=xmba1f';
 
 export function SubAccountsCard() {
   const t = useT();
@@ -88,9 +92,10 @@ export function SubAccountsCard() {
   const canSubmit =
     addState.label.length > 0 &&
     addState.apiKey.length > 0 &&
-    /^0x[0-9a-fA-F]{64}$/.test(addState.apiSecret) &&
-    /^0x[0-9a-fA-F]{40}$/.test(addState.tradingAddress) &&
-    addState.accountId.length > 0 &&
+    addState.apiSecret.length > 0 &&
+    (addState.exchange === 'bitunix' || /^0x[0-9a-fA-F]{64}$/.test(addState.apiSecret)) &&
+    (addState.exchange === 'bitunix' || /^0x[0-9a-fA-F]{40}$/.test(addState.tradingAddress)) &&
+    (addState.exchange === 'bitunix' || addState.accountId.length > 0) &&
     !createMutation.isPending;
 
   async function handleDelete(id: number, label: string) {
@@ -144,6 +149,9 @@ export function SubAccountsCard() {
                 <div className="flex items-center gap-2">
                   <span className="font-medium text-text-primary">
                     {s.label}
+                  </span>
+                  <span className="text-2xs text-text-muted uppercase">
+                    {s.exchange ?? 'grvt'}
                   </span>
                   {s.isDefault && (
                     <span className="text-2xs text-primary uppercase tracking-wider">
@@ -221,6 +229,41 @@ export function SubAccountsCard() {
         }
       >
         <div className="space-y-3">
+          <div>
+            <label className="block text-xs font-medium text-text-muted mb-1">
+              Exchange
+            </label>
+            <select
+              value={addState.exchange}
+              onChange={(e) =>
+                setAddState({
+                  ...addState,
+                  exchange: e.target.value as AddState['exchange'],
+                  tradingAddress: '',
+                  accountId: '',
+                  subAccountId: '',
+                })
+              }
+              disabled={createMutation.isPending}
+              className="w-full h-10 rounded-md border border-border-subtle bg-bg-surface px-3 text-sm text-text-primary"
+            >
+              <option value="bitunix">Bitunix</option>
+              <option value="grvt">GRVT</option>
+            </select>
+            {addState.exchange === 'bitunix' && (
+              <p className="mt-1 text-2xs text-text-muted">
+                Crear cuenta Bitunix:{' '}
+                <a
+                  href={BITUNIX_REFERRAL_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary hover:underline"
+                >
+                  enlace de referido
+                </a>
+              </p>
+            )}
+          </div>
           <Input
             label={t('settings.subAccounts.label')}
             placeholder={t('settings.subAccounts.labelPlaceholder')}
@@ -250,36 +293,41 @@ export function SubAccountsCard() {
             disabled={createMutation.isPending}
             autoComplete="off"
             error={
+              addState.exchange === 'grvt' &&
               addState.apiSecret &&
               !/^0x[0-9a-fA-F]{64}$/.test(addState.apiSecret)
                 ? t('settings.subAccounts.apiSecretError')
                 : undefined
             }
           />
-          <Input
-            label={t('settings.subAccounts.tradingAddress')}
-            value={addState.tradingAddress}
-            onChange={(e) =>
-              setAddState({ ...addState, tradingAddress: e.target.value })
-            }
-            disabled={createMutation.isPending}
-            autoComplete="off"
-            error={
-              addState.tradingAddress &&
-              !/^0x[0-9a-fA-F]{40}$/.test(addState.tradingAddress)
-                ? t('settings.subAccounts.tradingAddressError')
-                : undefined
-            }
-          />
-          <Input
-            label={t('settings.subAccounts.accountId')}
-            value={addState.accountId}
-            onChange={(e) =>
-              setAddState({ ...addState, accountId: e.target.value })
-            }
-            disabled={createMutation.isPending}
-            autoComplete="off"
-          />
+          {addState.exchange === 'grvt' && (
+            <>
+              <Input
+                label={t('settings.subAccounts.tradingAddress')}
+                value={addState.tradingAddress}
+                onChange={(e) =>
+                  setAddState({ ...addState, tradingAddress: e.target.value })
+                }
+                disabled={createMutation.isPending}
+                autoComplete="off"
+                error={
+                  addState.tradingAddress &&
+                  !/^0x[0-9a-fA-F]{40}$/.test(addState.tradingAddress)
+                    ? t('settings.subAccounts.tradingAddressError')
+                    : undefined
+                }
+              />
+              <Input
+                label={t('settings.subAccounts.accountId')}
+                value={addState.accountId}
+                onChange={(e) =>
+                  setAddState({ ...addState, accountId: e.target.value })
+                }
+                disabled={createMutation.isPending}
+                autoComplete="off"
+              />
+            </>
+          )}
           <div className="space-y-1">
             <Input
               label={t('settings.subAccounts.subAccountId')}

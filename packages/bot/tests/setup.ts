@@ -3,6 +3,16 @@
 
 import { vi, beforeAll, afterEach } from 'vitest';
 
+// These must be available at module-load time. Several source modules create
+// the default trading client during import, before Vitest's beforeAll hooks run.
+process.env.MOCK_MODE = 'true';
+process.env.EXCHANGE = process.env.EXCHANGE || 'grvt';
+process.env.GRVT_API_SECRET = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
+process.env.GRVT_TRADING_ADDRESS = '0xAbCdEf0123456789AbCdEf0123456789AbCdEf01';
+process.env.GRVT_TRADING_ACCOUNT_ID = '1';
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-jwt-secret-32-chars-minimum-value';
+process.env.DISABLE_RATE_LIMIT = process.env.DISABLE_RATE_LIMIT || '1';
+
 // Mock de GRVT Client
 export const mockGrvtClient = {
   getOpenOrders: vi.fn(),
@@ -45,11 +55,6 @@ const mockConsole = {
 beforeAll(() => {
   // Replace console
   global.console = mockConsole as any;
-  
-  // Mock environment variables (match names used by order-signer.ts fallback path)
-  process.env.GRVT_API_SECRET = '0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
-  process.env.GRVT_TRADING_ADDRESS = '0xAbCdEf0123456789AbCdEf0123456789AbCdEf01';
-  process.env.GRVT_TRADING_ACCOUNT_ID = '1';
 });
 
 afterEach(() => {

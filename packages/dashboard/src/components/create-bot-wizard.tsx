@@ -52,6 +52,7 @@ interface CreateBotWizardProps {
 }
 
 interface WizardState {
+  exchange: 'grvt' | 'bitunix';
   pair: string;
   direction: 'long' | 'short';
   lower: string; // strings while user types
@@ -75,6 +76,7 @@ interface WizardState {
 }
 
 const INITIAL_STATE: WizardState = {
+  exchange: 'bitunix',
   pair: '',
   direction: 'long',
   lower: '',
@@ -98,8 +100,9 @@ const INITIAL_STATE: WizardState = {
 
 // H.1: hardcoded fallback — used while the API query is loading
 const FALLBACK_PAIRS = [
-  { value: 'ETH_USDT_Perp', label: 'ETH-USDT-Perp' },
   { value: 'BTC_USDT_Perp', label: 'BTC-USDT-Perp' },
+  { value: 'ETH_USDT_Perp', label: 'ETH-USDT-Perp' },
+  { value: 'SOL_USDT_Perp', label: 'SOL-USDT-Perp' },
 ];
 
 type Step = 0 | 1 | 2 | 3;
@@ -133,8 +136,8 @@ export function CreateBotWizard({ open, onClose, preset }: CreateBotWizardProps)
 
   // H.1: fetch available instruments from GRVT API
   const instrumentsQuery = useQuery({
-    queryKey: ['instruments'],
-    queryFn: () => api.getInstruments(),
+    queryKey: ['instruments', state.exchange],
+    queryFn: () => api.getInstruments(state.exchange),
     staleTime: 60_000,
     enabled: open,
   });
@@ -222,6 +225,7 @@ export function CreateBotWizard({ open, onClose, preset }: CreateBotWizardProps)
       ? { grvt_sub_account_id: parseInt(state.subAccountId, 10) }
       : {};
     createMutation.mutate({
+      exchange: state.exchange,
       pair: validated.pair,
       direction: validated.direction,
       lower_price: validated.input.lower,
@@ -265,6 +269,7 @@ export function CreateBotWizard({ open, onClose, preset }: CreateBotWizardProps)
   function next() {
     if (step === 2) {
       const input: ValidateBotInput = {
+        exchange: state.exchange,
         pair: state.pair,
         direction: state.direction,
         lower_price: parseFloat(state.lower),
@@ -429,10 +434,11 @@ function StepPair({
   state: WizardState;
   update: <K extends keyof WizardState>(k: K, v: WizardState[K]) => void;
   pairs: Array<{ value: string; label: string }>;
-  subAccounts: Array<{ id: number; label: string; isDefault: boolean }>;
+  subAccounts: Array<{ id: number; label: string; isDefault: boolean; exchange?: 'grvt' | 'bitunix' }>;
 }) {
   const t = useT();
   const [query, setQuery] = useState('');
+  const exchangeSubAccounts = subAccounts.filter((s) => (s.exchange ?? 'grvt') === state.exchange);
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return pairs;
@@ -444,10 +450,26 @@ function StepPair({
 
   return (
     <div>
+      <div className="mb-5">
+        <h3 className="text-sm font-semibold text-text-primary mb-2">
+          Exchange
+        </h3>
+        <select
+          value={state.exchange}
+          onChange={(e) => {
+            update('exchange', e.target.value as WizardState['exchange']);
+            update('subAccountId', '');
+          }}
+          className="w-full h-10 rounded-md border border-border-subtle bg-bg-surface px-3 text-sm text-text-primary"
+        >
+          <option value="bitunix">Bitunix</option>
+          <option value="grvt">GRVT</option>
+        </select>
+      </div>
       {/* H.5: only show the picker when the user has at least one sub-account.
           Otherwise the bot routes through default credentials and the UI is
           identical to the pre-H.5 wizard. */}
-      {subAccounts.length > 0 && (
+      {exchangeSubAccounts.length > 0 && (
         <div className="mb-5">
           <h3 className="text-sm font-semibold text-text-primary mb-2">
             {t('wizard.subAccountTitle')}
@@ -458,7 +480,7 @@ function StepPair({
             className="w-full h-10 rounded-md border border-border-subtle bg-bg-surface px-3 text-sm text-text-primary"
           >
             <option value="">{t('wizard.subAccountDefault')}</option>
-            {subAccounts.map((s) => (
+            {exchangeSubAccounts.map((s) => (
               <option key={s.id} value={String(s.id)}>
                 {s.label}
                 {s.isDefault ? ` (${t('settings.subAccounts.default')})` : ''}
@@ -569,6 +591,7 @@ function StepRange({
 
       <RangePickerChart
         pair={state.pair}
+        exchange={state.exchange}
         lower={lo || 0}
         upper={hi || 0}
         onLowerChange={(v) => update('lower', v.toFixed(2))}

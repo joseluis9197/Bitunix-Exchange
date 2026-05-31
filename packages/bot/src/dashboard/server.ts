@@ -66,16 +66,19 @@ async function initializeServices() {
           console.log(`👤 Owner bootstrap skipped (users already exist; owner=${result.userId})`);
         }
 
-        // If GRVT env creds are present AND the owner doesn't have
+        // If env creds are present AND the owner doesn't have
         // DB-stored creds yet, encrypt and persist them so the owner
         // gets hasGrvtCreds=true and doesn't hit the onboarding page.
-        const grvtApiKey = process.env.GRVT_API_KEY;
-        const grvtApiSecret = process.env.GRVT_API_SECRET;
-        const grvtTradingAddress = process.env.GRVT_TRADING_ADDRESS;
-        const grvtAccountId = process.env.GRVT_ACCOUNT_ID || '';
-        const grvtSubAccountId = process.env.GRVT_TRADING_ACCOUNT_ID || '';
+        const defaultExchange = (process.env.EXCHANGE || process.env.DEFAULT_EXCHANGE || 'grvt').toLowerCase() === 'bitunix'
+          ? 'bitunix'
+          : 'grvt';
+        const grvtApiKey = defaultExchange === 'bitunix' ? process.env.BITUNIX_API_KEY : process.env.GRVT_API_KEY;
+        const grvtApiSecret = defaultExchange === 'bitunix' ? process.env.BITUNIX_API_SECRET : process.env.GRVT_API_SECRET;
+        const grvtTradingAddress = defaultExchange === 'bitunix' ? '' : (process.env.GRVT_TRADING_ADDRESS || '');
+        const grvtAccountId = defaultExchange === 'bitunix' ? (process.env.BITUNIX_ACCOUNT_ID || 'bitunix') : (process.env.GRVT_ACCOUNT_ID || '');
+        const grvtSubAccountId = defaultExchange === 'bitunix' ? (process.env.BITUNIX_SUB_ACCOUNT_ID || grvtAccountId) : (process.env.GRVT_TRADING_ACCOUNT_ID || '');
         const hasDbCreds = await db.hasGrvtCredentials(result.userId);
-        if (grvtApiKey && grvtApiSecret && grvtTradingAddress && grvtSubAccountId && !hasDbCreds) {
+        if (grvtApiKey && grvtApiSecret && (defaultExchange === 'bitunix' || grvtTradingAddress) && grvtSubAccountId && !hasDbCreds) {
           try {
             const { encryptCredentialFields } = await import('../auth/crypto.js');
             const encrypted = encryptCredentialFields({
@@ -87,6 +90,7 @@ async function initializeServices() {
             });
             await db.upsertGrvtCredentials({
               user_id: result.userId,
+              exchange: defaultExchange,
               ...encrypted,
               last_test_ok: true,
               last_test_error: null,

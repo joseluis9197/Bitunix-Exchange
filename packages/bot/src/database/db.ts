@@ -6,6 +6,7 @@ import sqlite3 from 'sqlite3';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs';
+import { computeQtyPerLevelForPair } from '../bot/quantity.js';
 
 // Configurar SQLite para verbose logging en desarrollo
 const Database = process.env.NODE_ENV === 'production' ? sqlite3.Database : sqlite3.verbose().Database;
@@ -16,6 +17,7 @@ export interface GridBot {
   // bots; nullable on the type for backward compat with rows from
   // before the migration (those get backfilled by ownerBootstrap).
   user_id?: number;
+  exchange?: 'grvt' | 'bitunix';
   pair: string;
   direction: 'long' | 'short';
   leverage: number;
@@ -227,6 +229,7 @@ export class GridBotDB {
     await this.dbRun(`
       CREATE TABLE IF NOT EXISTS grid_bots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        exchange TEXT NOT NULL DEFAULT 'grvt',
         pair TEXT NOT NULL,
         direction TEXT NOT NULL CHECK (direction IN ('long', 'short')),
         leverage INTEGER NOT NULL,
@@ -382,9 +385,12 @@ export class GridBotDB {
       // application-layer guards (delete blocked when bots reference)
       // keep referential integrity.
       'grvt_sub_account_id INTEGER',
+      // Multi-exchange: legacy rows/default credentials are GRVT.
+      "exchange TEXT DEFAULT 'grvt'",
     ]) {
       try { await this.dbRun(`ALTER TABLE grid_bots ADD COLUMN ${col}`); } catch (e) { /* exists */ }
     }
+    await this.dbRun(`UPDATE grid_bots SET exchange = 'grvt' WHERE exchange IS NULL OR exchange = ''`);
 
     // H.8: Add `state` column to grid_levels ('active' | 'virtual' | 'filled')
     try { await this.dbRun(`ALTER TABLE grid_levels ADD COLUMN state TEXT DEFAULT 'active'`); } catch (e) { /* exists */ }
@@ -489,12 +495,21 @@ export class GridBotDB {
     // Add the missing columns and backfill from old columns.
     for (const col of [
       'date TEXT',
+      'timestamp TEXT',
       'equity REAL DEFAULT 0',
+      'balance_usdt REAL DEFAULT 0',
+      'equity_usdt REAL DEFAULT 0',
       'grid_profit_net REAL DEFAULT 0',
+      'grid_profit_usdt REAL DEFAULT 0',
       'trend_pnl REAL DEFAULT 0',
+      'trend_pnl_usdt REAL DEFAULT 0',
       'total_pnl REAL DEFAULT 0',
+      'total_pnl_usdt REAL DEFAULT 0',
       'round_trips INTEGER DEFAULT 0',
+      'num_round_trips INTEGER DEFAULT 0',
       'eth_price REAL',
+      'position_size REAL DEFAULT 0',
+      'drawdown_pct REAL DEFAULT 0',
     ]) {
       try { await this.dbRun(`ALTER TABLE daily_snapshots ADD COLUMN ${col}`); } catch (e) { /* exists */ }
     }
@@ -641,7 +656,8 @@ export class GridBotDB {
     // every user must re-paste their credentials.
     await this.dbRun(`
       CREATE TABLE IF NOT EXISTS grvt_credentials (
-        user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        exchange TEXT NOT NULL DEFAULT 'grvt',
         encrypted_api_key TEXT NOT NULL,
         api_key_iv TEXT NOT NULL,
         api_key_tag TEXT NOT NULL,
@@ -661,7 +677,8 @@ export class GridBotDB {
         last_used_at INTEGER,
         last_test_ok INTEGER,
         last_test_at INTEGER,
-        last_test_error TEXT
+        last_test_error TEXT,
+        PRIMARY KEY (user_id, exchange)
       )
     `);
 
@@ -693,6 +710,7 @@ export class GridBotDB {
       CREATE TABLE IF NOT EXISTS grvt_sub_accounts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        exchange TEXT NOT NULL DEFAULT 'grvt',
         label TEXT NOT NULL DEFAULT 'Default',
         encrypted_api_key TEXT NOT NULL,
         api_key_iv TEXT NOT NULL,
@@ -715,6 +733,66 @@ export class GridBotDB {
       )
     `);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_sub_accounts_user ON grvt_sub_accounts(user_id)`);
+    for (const table of ['grvt_credentials', 'grvt_sub_accounts']) {
+      try { await this.dbRun(`ALTER TABLE ${table} ADD COLUMN exchange TEXT DEFAULT 'grvt'`); } catch (e) { /* exists */ }
+      await this.dbRun(`UPDATE ${table} SET exchange = 'grvt' WHERE exchange IS NULL OR exchange = ''`);
+    }
+
+    const credentialColumns = await this.dbAll(`PRAGMA table_info(grvt_credentials)`);
+    const userPk = credentialColumns.find((col) => col.name === 'user_id')?.pk ?? 0;
+    const exchangePk = credentialColumns.find((col) => col.name === 'exchange')?.pk ?? 0;
+    if (userPk === 1 && exchangePk === 0) {
+      const backup = `grvt_credentials_single_pk_${Date.now()}`;
+      await this.dbRun(`ALTER TABLE grvt_credentials RENAME TO ${backup}`);
+      await this.dbRun(`
+        CREATE TABLE grvt_credentials (
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          exchange TEXT NOT NULL DEFAULT 'grvt',
+          encrypted_api_key TEXT NOT NULL,
+          api_key_iv TEXT NOT NULL,
+          api_key_tag TEXT NOT NULL,
+          encrypted_api_secret TEXT NOT NULL,
+          api_secret_iv TEXT NOT NULL,
+          api_secret_tag TEXT NOT NULL,
+          encrypted_trading_address TEXT NOT NULL,
+          trading_address_iv TEXT NOT NULL,
+          trading_address_tag TEXT NOT NULL,
+          encrypted_account_id TEXT NOT NULL,
+          account_id_iv TEXT NOT NULL,
+          account_id_tag TEXT NOT NULL,
+          encrypted_sub_account_id TEXT NOT NULL,
+          sub_account_id_iv TEXT NOT NULL,
+          sub_account_id_tag TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          last_used_at INTEGER,
+          last_test_ok INTEGER,
+          last_test_at INTEGER,
+          last_test_error TEXT,
+          PRIMARY KEY (user_id, exchange)
+        )
+      `);
+      await this.dbRun(`
+        INSERT OR REPLACE INTO grvt_credentials (
+          user_id, exchange,
+          encrypted_api_key, api_key_iv, api_key_tag,
+          encrypted_api_secret, api_secret_iv, api_secret_tag,
+          encrypted_trading_address, trading_address_iv, trading_address_tag,
+          encrypted_account_id, account_id_iv, account_id_tag,
+          encrypted_sub_account_id, sub_account_id_iv, sub_account_id_tag,
+          created_at, last_used_at, last_test_ok, last_test_at, last_test_error
+        )
+        SELECT
+          user_id, COALESCE(exchange, 'grvt'),
+          encrypted_api_key, api_key_iv, api_key_tag,
+          encrypted_api_secret, api_secret_iv, api_secret_tag,
+          encrypted_trading_address, trading_address_iv, trading_address_tag,
+          encrypted_account_id, account_id_iv, account_id_tag,
+          encrypted_sub_account_id, sub_account_id_iv, sub_account_id_tag,
+          created_at, last_used_at, last_test_ok, last_test_at, last_test_error
+        FROM ${backup}
+      `);
+      await this.dbRun(`DROP TABLE ${backup}`);
+    }
 
     // E.9: password reset tokens. We store SHA-256 of the raw token, never
     // the raw value — if the DB leaks, the tokens are not directly usable.
@@ -758,6 +836,7 @@ export class GridBotDB {
       }
     }
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_grid_bots_user ON grid_bots(user_id)`);
+    await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_grid_bots_exchange ON grid_bots(exchange)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_trades_user ON trades(user_id)`);
     await this.dbRun(`CREATE INDEX IF NOT EXISTS idx_fills_arch_user ON fills_archive(user_id)`);
@@ -815,12 +894,14 @@ export class GridBotDB {
     // it immutably. Same formula as the legacy getFixedQty() but only
     // ever evaluated here, so subsequent compounds and updateBotRange
     // calls cannot drift it.
-    const ORDER_ALLOC = 0.75;
     const midPrice = (params.lower_price + params.upper_price) / 2;
-    const effCap = params.investment_usdt * params.leverage * ORDER_ALLOC;
-    const computedQty = Math.max(
-      Math.ceil((effCap / params.num_grids / midPrice) * 100) / 100,
-      0.03
+    const computedQty = computeQtyPerLevelForPair(
+      params.investment_usdt,
+      params.leverage,
+      params.num_grids,
+      midPrice,
+      params.pair,
+      params.lower_price
     );
     // Allow caller override (e.g. wizard preview) but default to the
     // formula above when params.quantity_per_level is not provided.
@@ -841,6 +922,7 @@ export class GridBotDB {
     // the original is immutable so we always know the real cash deposit.
     const values = [
       params.user_id ?? null,
+      params.exchange ?? 'grvt',
       params.pair, params.direction, params.leverage, params.lower_price,
       params.upper_price, params.num_grids, params.investment_usdt,
       params.investment_usdt,  // original_investment_usdt = investment_usdt
@@ -854,13 +936,13 @@ export class GridBotDB {
     ];
     const sql = `
       INSERT INTO grid_bots (
-        user_id,
+        user_id, exchange,
         pair, direction, leverage, lower_price, upper_price, num_grids,
         investment_usdt, original_investment_usdt, quantity_per_level,
         grid_profit_usdt, trend_pnl_usdt, total_pnl_usdt,
         status, position_size, avg_entry_price, liquidation_price, params_json,
         virtual_enabled, active_window_size, grvt_sub_account_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `;
 
     await this.dbRun(sql, values);
@@ -1481,10 +1563,12 @@ export class GridBotDB {
     event_time: string;
   }>> {
     return this.dbAll(`
-      SELECT fill_id, is_buyer, price, size, fee, event_time
-      FROM fills_archive
-      WHERE bot_id = ?
-      ORDER BY event_time ASC
+      SELECT fa.fill_id, fa.is_buyer, fa.price, fa.size, fa.fee, fa.event_time
+      FROM fills_archive fa
+      JOIN grid_bots b ON b.id = fa.bot_id
+      WHERE fa.bot_id = ?
+        AND CAST(fa.event_time AS INTEGER) >= CAST(strftime('%s', b.created_at) AS INTEGER) * 1000000000
+      ORDER BY CAST(fa.event_time AS INTEGER) ASC
     `, [botId]);
   }
 
@@ -1662,24 +1746,53 @@ export class GridBotDB {
     return (result.changes ?? 0) > 0;
   }
 
+  /** Rebuild support: paired round-trips are derived from fills_archive. */
+  async clearPairedRoundtripsForBot(botId: number): Promise<void> {
+    await this.dbRun(`DELETE FROM paired_roundtrips WHERE bot_id = ?`, [botId]);
+  }
+
   /** Count paired roundtrips for a specific bot. */
   async countPairedRoundtrips(botId: number): Promise<number> {
     const row = await this.dbGet(
-      `SELECT COUNT(*) as c FROM paired_roundtrips WHERE bot_id = ?`, [botId]);
+      `SELECT COUNT(*) as c
+       FROM paired_roundtrips pr
+       JOIN grid_bots b ON b.id = pr.bot_id
+       WHERE pr.bot_id = ?
+         AND (
+           CASE
+             WHEN pr.created_at NOT GLOB '*[^0-9]*'
+               THEN CAST(pr.created_at AS INTEGER)
+             ELSE CAST(strftime('%s', pr.created_at) AS INTEGER) * 1000000000
+           END
+         ) >= CAST(strftime('%s', b.created_at) AS INTEGER) * 1000000000`, [botId]);
     return row?.c || 0;
   }
 
   /** Sum gross profit from paired roundtrips for a specific bot. */
   async sumPairedRoundtripProfit(botId: number): Promise<number> {
     const row = await this.dbGet(
-      `SELECT COALESCE(SUM(profit), 0) as p FROM paired_roundtrips WHERE bot_id = ?`, [botId]);
+      `SELECT COALESCE(SUM(pr.profit), 0) as p
+       FROM paired_roundtrips pr
+       JOIN grid_bots b ON b.id = pr.bot_id
+       WHERE pr.bot_id = ?
+         AND (
+           CASE
+             WHEN pr.created_at NOT GLOB '*[^0-9]*'
+               THEN CAST(pr.created_at AS INTEGER)
+             ELSE CAST(strftime('%s', pr.created_at) AS INTEGER) * 1000000000
+           END
+         ) >= CAST(strftime('%s', b.created_at) AS INTEGER) * 1000000000`, [botId]);
     return row?.p || 0;
   }
 
   /** Sum fees from fills_archive for a specific bot. */
   async sumFeesForBot(botId: number): Promise<number> {
     const row = await this.dbGet(
-      `SELECT COALESCE(SUM(fee), 0) as f FROM fills_archive WHERE bot_id = ?`, [botId]);
+      `SELECT COALESCE(SUM(fa.fee), 0) as f
+       FROM fills_archive fa
+       JOIN grid_bots b ON b.id = fa.bot_id
+       WHERE fa.bot_id = ?
+         AND CAST(fa.event_time AS INTEGER) >= CAST(strftime('%s', b.created_at) AS INTEGER) * 1000000000`, [botId]);
     return row?.f || 0;
   }
 
@@ -1857,6 +1970,7 @@ export class GridBotDB {
 
   async upsertGrvtCredentials(params: {
     user_id: number;
+    exchange?: 'grvt' | 'bitunix';
     encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
     encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
     encrypted_trading_address: string;trading_address_iv: string;trading_address_tag: string;
@@ -1868,15 +1982,16 @@ export class GridBotDB {
     const now = Date.now();
     await this.dbRun(
       `INSERT INTO grvt_credentials (
-        user_id,
+        user_id, exchange,
         encrypted_api_key, api_key_iv, api_key_tag,
         encrypted_api_secret, api_secret_iv, api_secret_tag,
         encrypted_trading_address, trading_address_iv, trading_address_tag,
         encrypted_account_id, account_id_iv, account_id_tag,
         encrypted_sub_account_id, sub_account_id_iv, sub_account_id_tag,
         created_at, last_test_ok, last_test_at, last_test_error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(user_id) DO UPDATE SET
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, exchange) DO UPDATE SET
+        exchange = excluded.exchange,
         encrypted_api_key = excluded.encrypted_api_key,
         api_key_iv = excluded.api_key_iv,
         api_key_tag = excluded.api_key_tag,
@@ -1898,6 +2013,7 @@ export class GridBotDB {
       `,
       [
         params.user_id,
+        params.exchange ?? 'grvt',
         params.encrypted_api_key, params.api_key_iv, params.api_key_tag,
         params.encrypted_api_secret, params.api_secret_iv, params.api_secret_tag,
         params.encrypted_trading_address, params.trading_address_iv, params.trading_address_tag,
@@ -1910,6 +2026,21 @@ export class GridBotDB {
 
   async getGrvtCredentialsRaw(userId: number): Promise<{
     user_id: number;
+    exchange?: 'grvt' | 'bitunix';
+    encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
+    encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
+    encrypted_trading_address: string;trading_address_iv: string;trading_address_tag: string;
+    encrypted_account_id: string;     account_id_iv: string;     account_id_tag: string;
+    encrypted_sub_account_id: string; sub_account_id_iv: string; sub_account_id_tag: string;
+    created_at: number;
+    last_used_at: number | null;
+    last_test_ok: number | null;
+    last_test_at: number | null;
+    last_test_error: string | null;
+  } | null>;
+  async getGrvtCredentialsRaw(userId: number, exchange?: 'grvt' | 'bitunix' | string | null): Promise<{
+    user_id: number;
+    exchange?: 'grvt' | 'bitunix';
     encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
     encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
     encrypted_trading_address: string;trading_address_iv: string;trading_address_tag: string;
@@ -1921,19 +2052,44 @@ export class GridBotDB {
     last_test_at: number | null;
     last_test_error: string | null;
   } | null> {
+    if (exchange) {
+      return await this.dbGet(
+        `SELECT * FROM grvt_credentials WHERE user_id = ? AND COALESCE(exchange, 'grvt') = ?`,
+        [userId, String(exchange)]
+      );
+    }
     return await this.dbGet(`SELECT * FROM grvt_credentials WHERE user_id = ?`, [userId]);
   }
 
-  async hasGrvtCredentials(userId: number): Promise<boolean> {
-    const row = await this.dbGet(`SELECT 1 FROM grvt_credentials WHERE user_id = ?`, [userId]);
+  async hasGrvtCredentials(userId: number, exchange?: 'grvt' | 'bitunix' | string | null): Promise<boolean> {
+    const row = exchange
+      ? await this.dbGet(
+          `SELECT 1 FROM grvt_credentials WHERE user_id = ? AND COALESCE(exchange, 'grvt') = ?`,
+          [userId, String(exchange)]
+        )
+      : await this.dbGet(`SELECT 1 FROM grvt_credentials WHERE user_id = ?`, [userId]);
     return !!row;
   }
 
-  async deleteGrvtCredentials(userId: number): Promise<void> {
+  async deleteGrvtCredentials(userId: number, exchange?: 'grvt' | 'bitunix' | string | null): Promise<void> {
+    if (exchange) {
+      await this.dbRun(
+        `DELETE FROM grvt_credentials WHERE user_id = ? AND COALESCE(exchange, 'grvt') = ?`,
+        [userId, String(exchange)]
+      );
+      return;
+    }
     await this.dbRun(`DELETE FROM grvt_credentials WHERE user_id = ?`, [userId]);
   }
 
-  async touchGrvtCredentialsLastUsed(userId: number): Promise<void> {
+  async touchGrvtCredentialsLastUsed(userId: number, exchange?: 'grvt' | 'bitunix' | string | null): Promise<void> {
+    if (exchange) {
+      await this.dbRun(
+        `UPDATE grvt_credentials SET last_used_at = ? WHERE user_id = ? AND COALESCE(exchange, 'grvt') = ?`,
+        [Date.now(), userId, String(exchange)]
+      );
+      return;
+    }
     await this.dbRun(
       `UPDATE grvt_credentials SET last_used_at = ? WHERE user_id = ?`,
       [Date.now(), userId]
@@ -1948,13 +2104,14 @@ export class GridBotDB {
   async listGrvtSubAccounts(userId: number): Promise<Array<{
     id: number;
     user_id: number;
+    exchange?: 'grvt' | 'bitunix';
     label: string;
     is_default: number;
     last_test_ok: number | null;
     created_at: number;
   }>> {
     return await this.dbAll(
-      `SELECT id, user_id, label, is_default, last_test_ok, created_at
+      `SELECT id, user_id, exchange, label, is_default, last_test_ok, created_at
          FROM grvt_sub_accounts
         WHERE user_id = ?
         ORDER BY is_default DESC, created_at ASC`,
@@ -1965,6 +2122,7 @@ export class GridBotDB {
   async getGrvtSubAccountRaw(id: number): Promise<{
     id: number;
     user_id: number;
+    exchange?: 'grvt' | 'bitunix';
     label: string;
     encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
     encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
@@ -1983,6 +2141,7 @@ export class GridBotDB {
 
   async createGrvtSubAccount(params: {
     user_id: number;
+    exchange?: 'grvt' | 'bitunix';
     label: string;
     encrypted_api_key: string;        api_key_iv: string;        api_key_tag: string;
     encrypted_api_secret: string;     api_secret_iv: string;     api_secret_tag: string;
@@ -2001,22 +2160,22 @@ export class GridBotDB {
     // call which orders by is_default DESC.
     if (params.is_default) {
       await this.dbRun(
-        `UPDATE grvt_sub_accounts SET is_default = 0 WHERE user_id = ?`,
-        [params.user_id]
+        `UPDATE grvt_sub_accounts SET is_default = 0 WHERE user_id = ? AND COALESCE(exchange, 'grvt') = ?`,
+        [params.user_id, params.exchange ?? 'grvt']
       );
     }
     const result = await this.dbRun(
       `INSERT INTO grvt_sub_accounts (
-        user_id, label,
+        user_id, exchange, label,
         encrypted_api_key, api_key_iv, api_key_tag,
         encrypted_api_secret, api_secret_iv, api_secret_tag,
         encrypted_trading_address, trading_address_iv, trading_address_tag,
         encrypted_account_id, account_id_iv, account_id_tag,
         encrypted_sub_account_id, sub_account_id_iv, sub_account_id_tag,
         is_default, last_test_ok, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        params.user_id, params.label,
+        params.user_id, params.exchange ?? 'grvt', params.label,
         params.encrypted_api_key, params.api_key_iv, params.api_key_tag,
         params.encrypted_api_secret, params.api_secret_iv, params.api_secret_tag,
         params.encrypted_trading_address, params.trading_address_iv, params.trading_address_tag,

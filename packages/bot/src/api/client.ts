@@ -12,12 +12,24 @@ import {
 } from './auth.js';
 import { signOrder, formatSignedOrderForAPI } from './order-signer.js';
 import dotenv from 'dotenv';
+import { createHash, randomBytes } from 'node:crypto';
 
 dotenv.config();
 
 // Endpoints GRVT verificados por Marta
 const MARKET_DATA_URL = 'https://market-data.grvt.io/full/v1';
 const TRADING_URL = 'https://trades.grvt.io/full/v1';
+const BITUNIX_FUTURES_URL = process.env.BITUNIX_FUTURES_BASE_URL || 'https://fapi.bitunix.com';
+
+export type ExchangeId = 'grvt' | 'bitunix';
+
+export interface ExchangeClientCreds {
+  apiKey: string;
+  apiSecret: string;
+  tradingAddress?: string;
+  accountId?: string;
+  subAccountId?: string;
+}
 
 // Tipos para las respuestas de la API
 export interface Balance {
@@ -33,6 +45,7 @@ export interface Balance {
 export interface Position {
   sub_account_id: string;
   instrument: string;
+  position_id?: string;
   size: string;
   notional: string;
   entry_price: string;
@@ -91,6 +104,27 @@ export interface CreateOrderRequest {
   time_in_force?: 'gtc' | 'ioc' | 'fok';
   post_only?: boolean;
   metadata?: string;
+}
+
+export interface TradingClient {
+  readonly exchange: ExchangeId;
+  readonly subAccountId: string;
+  login(): Promise<boolean>;
+  getTicker(instrument: string): Promise<Ticker>;
+  getTickers(instruments: string[]): Promise<Ticker[]>;
+  getInstruments(): Promise<any[]>;
+  getKlines(instrument: string, interval?: string, limit?: number): Promise<KlineCandle[]>;
+  getBalance(): Promise<Balance>;
+  getPositions(): Promise<Position[]>;
+  getPosition(instrument: string): Promise<Position | null>;
+  getOpenOrders(instrument?: string): Promise<Order[]>;
+  createOrder(request: CreateOrderRequest, allowMarket?: boolean): Promise<Order>;
+  cancelOrder(orderId: string, instrument: string): Promise<boolean>;
+  cancelAllOrders(instrument?: string): Promise<number>;
+  setLeverage(instrument: string, leverage: number): Promise<boolean>;
+  getFillHistory(limit?: number, instrument?: string, endTimeNs?: string): Promise<Fill[]>;
+  getFundingHistory(limit?: number, instrument?: string): Promise<FundingPayment[]>;
+  calculateLiquidationPrice(instrument: string, leverage: number): Promise<string>;
 }
 
 export interface KlineCandle {
@@ -197,6 +231,46 @@ export interface GrvtClientCreds {
   subAccountId: string;      // GRVT sub-account id
 }
 
+export function normalizeExchange(value: unknown): ExchangeId {
+  const raw = String(value ?? '').trim().toLowerCase();
+  if (raw === 'bitunix') return 'bitunix';
+  return 'grvt';
+}
+
+export function getDefaultExchangeId(): ExchangeId {
+  return normalizeExchange(process.env.EXCHANGE || process.env.DEFAULT_EXCHANGE || 'grvt');
+}
+
+export function toExchangeSymbol(instrument: string, exchange: ExchangeId): string {
+  if (exchange === 'grvt') return instrument;
+  const clean = instrument.trim();
+  const match = /^([A-Z0-9]+)_([A-Z0-9]+)(?:_Perp)?$/i.exec(clean);
+  if (match) return `${match[1]}${match[2]}`.toUpperCase();
+  return clean.replace(/_/g, '').replace(/PERP$/i, '').toUpperCase();
+}
+
+export function fromExchangeSymbol(symbol: string, exchange: ExchangeId): string {
+  if (exchange === 'grvt') return symbol;
+  const clean = symbol.trim().toUpperCase();
+  if (clean.endsWith('USDT')) return `${clean.slice(0, -4)}_USDT_Perp`;
+  if (clean.endsWith('USDC')) return `${clean.slice(0, -4)}_USDC_Perp`;
+  return clean;
+}
+
+function requireGrvtCreds(creds?: ExchangeClientCreds): GrvtClientCreds | undefined {
+  if (!creds) return undefined;
+  if (!creds.tradingAddress || !creds.accountId || !creds.subAccountId) {
+    throw new Error('GRVT credentials require tradingAddress, accountId and subAccountId');
+  }
+  return {
+    apiKey: creds.apiKey,
+    apiSecret: creds.apiSecret,
+    tradingAddress: creds.tradingAddress,
+    accountId: creds.accountId,
+    subAccountId: creds.subAccountId,
+  };
+}
+
 /**
  * GRVT API Client Class.
  *
@@ -205,7 +279,8 @@ export interface GrvtClientCreds {
  * env vars (legacy singleton mode). Each instance has its own auth
  * state so cookie sessions don't leak between users.
  */
-export class GRVTClient {
+export class GRVTClient implements TradingClient {
+  readonly exchange = 'grvt' as const;
   private tradingAccountId: string;
   // Per-instance credentials. null → use env (legacy path).
   private creds: GrvtClientCreds | null;
@@ -756,7 +831,488 @@ export class GRVTClient {
   }
 }
 
-// Instancia singleton del client
-export const grvtClient = new GRVTClient();
+function sha256Hex(input: string): string {
+  return createHash('sha256').update(input, 'utf8').digest('hex');
+}
+
+function compactQueryParams(params: Record<string, unknown>): string {
+  return Object.keys(params)
+    .filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== '')
+    .sort()
+    .map((key) => `${key}${String(params[key])}`)
+    .join('');
+}
+
+function toUrlSearchParams(params: Record<string, unknown>): URLSearchParams {
+  const qs = new URLSearchParams();
+  for (const key of Object.keys(params).sort()) {
+    const value = params[key];
+    if (value !== undefined && value !== null && value !== '') {
+      qs.set(key, String(value));
+    }
+  }
+  return qs;
+}
+
+function bitunixInterval(interval: string): string {
+  const map: Record<string, string> = {
+    CI_1_M: '1m',
+    CI_3_M: '3m',
+    CI_5_M: '5m',
+    CI_15_M: '15m',
+    CI_30_M: '30m',
+    CI_1_H: '1h',
+    CI_2_H: '2h',
+    CI_4_H: '4h',
+    CI_6_H: '6h',
+    CI_8_H: '8h',
+    CI_12_H: '12h',
+    CI_1_D: '1d',
+    CI_3_D: '3d',
+    CI_1_W: '1w',
+  };
+  return map[interval] ?? interval;
+}
+
+function bitunixTickSize(quotePrecision: unknown): number {
+  const precision = Number(quotePrecision);
+  if (!Number.isFinite(precision) || precision < 0) return 0.01;
+  return 1 / (10 ** precision);
+}
+
+function normalizeBitunixOrderStatus(status: unknown): Order['status'] {
+  const s = String(status ?? '').toUpperCase();
+  if (s === 'FILLED') return 'filled';
+  if (s === 'CANCELED' || s === 'CANCELLED' || s === 'PART_FILLED_CANCELED' || s === 'EXPIRED') return 'cancelled';
+  if (s === 'REJECTED') return 'rejected';
+  return 'open';
+}
+
+function normalizeBitunixTimeInForce(effect: unknown): Order['time_in_force'] {
+  const e = String(effect ?? '').toUpperCase();
+  if (e === 'IOC') return 'ioc';
+  if (e === 'FOK') return 'fok';
+  return 'gtc';
+}
+
+export class BitunixClient implements TradingClient {
+  readonly exchange = 'bitunix' as const;
+  private readonly creds: ExchangeClientCreds | null;
+  private readonly baseUrl: string;
+  private readonly tradingAccountId: string;
+
+  constructor(creds?: ExchangeClientCreds) {
+    this.creds = creds ?? null;
+    this.baseUrl = (process.env.BITUNIX_FUTURES_BASE_URL || BITUNIX_FUTURES_URL).replace(/\/$/, '');
+    this.tradingAccountId =
+      creds?.subAccountId ||
+      creds?.accountId ||
+      process.env.BITUNIX_SUB_ACCOUNT_ID ||
+      process.env.BITUNIX_ACCOUNT_ID ||
+      'bitunix';
+  }
+
+  get subAccountId(): string {
+    return this.tradingAccountId;
+  }
+
+  async login(): Promise<boolean> {
+    this.getApiCreds();
+    return true;
+  }
+
+  private getApiCreds(): { apiKey: string; apiSecret: string } {
+    const apiKey = this.creds?.apiKey || process.env.BITUNIX_API_KEY || '';
+    const apiSecret = this.creds?.apiSecret || process.env.BITUNIX_API_SECRET || '';
+    if (!apiKey || !apiSecret) {
+      throw new Error('BITUNIX_API_KEY/BITUNIX_API_SECRET missing');
+    }
+    return { apiKey, apiSecret };
+  }
+
+  private async publicRequest(path: string, params: Record<string, unknown> = {}): Promise<any> {
+    await rateLimiter.waitIfNeeded();
+    const qs = toUrlSearchParams(params);
+    const url = `${this.baseUrl}${path}${qs.toString() ? `?${qs.toString()}` : ''}`;
+    const res = await fetch(url, { method: 'GET', headers: { 'Content-Type': 'application/json' } });
+    const json = await res.json() as any;
+    if (!res.ok || Number(json?.code ?? 0) !== 0) {
+      throw new Error(`Bitunix public API error ${json?.code ?? res.status}: ${json?.msg ?? res.statusText}`);
+    }
+    return json.data;
+  }
+
+  private async privateRequest(
+    method: 'GET' | 'POST',
+    path: string,
+    params: Record<string, unknown> = {},
+    body?: Record<string, unknown>
+  ): Promise<any> {
+    await rateLimiter.waitIfNeeded();
+    const { apiKey, apiSecret } = this.getApiCreds();
+    const nonce = randomBytes(16).toString('hex');
+    const timestamp = Date.now().toString();
+    const queryParams = method === 'GET' ? compactQueryParams(params) : '';
+    const bodyString = method === 'POST' && body ? JSON.stringify(body) : '';
+    const digest = sha256Hex(nonce + timestamp + apiKey + queryParams + bodyString);
+    const sign = sha256Hex(digest + apiSecret);
+    const qs = method === 'GET' ? toUrlSearchParams(params) : new URLSearchParams();
+    const url = `${this.baseUrl}${path}${qs.toString() ? `?${qs.toString()}` : ''}`;
+
+    const res = await fetch(url, {
+      method,
+      headers: {
+        'api-key': apiKey,
+        nonce,
+        timestamp,
+        sign,
+        language: 'en-US',
+        'Content-Type': 'application/json',
+      },
+      body: method === 'POST' ? bodyString : undefined,
+    });
+    const json = await res.json() as any;
+    if (!res.ok || Number(json?.code ?? 0) !== 0) {
+      throw new Error(`Bitunix API error ${json?.code ?? res.status}: ${json?.msg ?? res.statusText}`);
+    }
+    return json.data;
+  }
+
+  async getTicker(instrument: string): Promise<Ticker> {
+    const symbol = toExchangeSymbol(instrument, this.exchange);
+    const [ticker, funding] = await Promise.all([
+      this.publicRequest('/api/v1/futures/market/tickers', { symbols: symbol }),
+      this.publicRequest('/api/v1/futures/market/funding_rate', { symbol }).catch(() => []),
+    ]);
+    const row = Array.isArray(ticker) ? ticker[0] : ticker;
+    if (!row) throw new Error(`Bitunix ticker not found for ${symbol}`);
+    const fundingRow = Array.isArray(funding) ? funding[0] : funding;
+    const last = String(row.lastPrice ?? row.last ?? row.markPrice ?? '0');
+    return {
+      instrument: fromExchangeSymbol(row.symbol ?? symbol, this.exchange),
+      last_price: last,
+      best_bid: last,
+      best_ask: last,
+      open_price: String(row.open ?? last),
+      high_price: String(row.high ?? last),
+      low_price: String(row.low ?? last),
+      volume_24h: String(row.baseVol ?? '0'),
+      buy_volume_24h_q: String(row.quoteVol ?? '0'),
+      sell_volume_24h_q: '0',
+      funding_rate: String(fundingRow?.fundingRate ?? '0'),
+      next_funding_time: Number(fundingRow?.nextFundingTime ?? 0),
+      mark_price: String(row.markPrice ?? last),
+    };
+  }
+
+  async getTickers(instruments: string[]): Promise<Ticker[]> {
+    return Promise.all(instruments.map((instrument) => this.getTicker(instrument)));
+  }
+
+  async getInstruments(): Promise<any[]> {
+    const data = await this.publicRequest('/api/v1/futures/market/trading_pairs', {});
+    const rows = Array.isArray(data) ? data : [];
+    for (const inst of rows) {
+      const instrument = fromExchangeSymbol(inst.symbol, this.exchange);
+      const minSize = parseFloat(inst.minTradeVolume ?? '0.001');
+      const tickSize = bitunixTickSize(inst.quotePrecision);
+      if (instrument && minSize > 0) {
+        instrumentSpecsCache.set(instrument, {
+          min_size: minSize,
+          min_notional: 5,
+          tick_size: tickSize,
+          base_decimals: Number(inst.basePrecision ?? 9),
+        });
+      }
+    }
+    return rows.map((inst) => ({
+      ...inst,
+      instrument: fromExchangeSymbol(inst.symbol, this.exchange),
+      min_size: inst.minTradeVolume,
+      tick_size: bitunixTickSize(inst.quotePrecision).toString(),
+    }));
+  }
+
+  async getKlines(
+    instrument: string,
+    interval: string = 'CI_1_H',
+    limit: number = 200
+  ): Promise<KlineCandle[]> {
+    const symbol = toExchangeSymbol(instrument, this.exchange);
+    const data = await this.publicRequest('/api/v1/futures/market/kline', {
+      symbol,
+      interval: bitunixInterval(interval),
+      limit: Math.min(limit, 200),
+      type: 'LAST_PRICE',
+    });
+    const rows = Array.isArray(data) ? data : [];
+    return rows.map((row): KlineCandle => {
+      const time = Number(row.time ?? row.openTime ?? Date.now());
+      return {
+        openTime: time,
+        closeTime: time,
+        open: Number(row.open ?? 0),
+        high: Number(row.high ?? 0),
+        low: Number(row.low ?? 0),
+        close: Number(row.close ?? 0),
+        volume: Number(row.baseVol ?? 0),
+        trades: 0,
+      };
+    });
+  }
+
+  async getBalance(): Promise<Balance> {
+    const data = await this.privateRequest('GET', '/api/v1/futures/account', { marginCoin: 'USDT' });
+    const row = Array.isArray(data) ? data[0] : data;
+    const available = parseFloat(row?.available ?? '0');
+    const frozen = parseFloat(row?.frozen ?? '0');
+    const margin = parseFloat(row?.margin ?? '0');
+    const unrealized =
+      parseFloat(row?.crossUnrealizedPNL ?? '0') +
+      parseFloat(row?.isolationUnrealizedPNL ?? '0');
+    const total = available + frozen + margin + unrealized;
+    return {
+      sub_account_id: this.tradingAccountId,
+      total_equity: total.toString(),
+      available_balance: String(row?.available ?? '0'),
+      margin_used: String(row?.margin ?? '0'),
+      maintenance_margin: '0',
+      initial_margin: String(row?.margin ?? '0'),
+      currency: 'USDT',
+    };
+  }
+
+  async getPositions(): Promise<Position[]> {
+    const data = await this.privateRequest('GET', '/api/v1/futures/position/get_pending_positions', {});
+    const rows = Array.isArray(data) ? data : [];
+    return rows.map((row): Position => {
+      const side = String(row.side ?? '').toUpperCase() === 'SHORT' ? 'sell' : 'buy';
+      const qty = parseFloat(row.qty ?? '0');
+      const signedSize = side === 'sell' ? -Math.abs(qty) : Math.abs(qty);
+      return {
+        sub_account_id: this.tradingAccountId,
+        instrument: fromExchangeSymbol(row.symbol, this.exchange),
+        position_id: row.positionId ? String(row.positionId) : undefined,
+        size: signedSize.toString(),
+        notional: String(row.entryValue ?? '0'),
+        entry_price: String(row.avgOpenPrice ?? '0'),
+        mark_price: String(row.markPrice ?? '0'),
+        unrealized_pnl: String(row.unrealizedPNL ?? '0'),
+        side,
+        leverage: String(row.leverage ?? '1'),
+        liquidation_price: String(row.liqPrice ?? '0'),
+        margin_used: String(row.margin ?? '0'),
+        funding_payment: String(row.funding ?? '0'),
+      };
+    });
+  }
+
+  async getPosition(instrument: string): Promise<Position | null> {
+    const target = fromExchangeSymbol(toExchangeSymbol(instrument, this.exchange), this.exchange);
+    const positions = await this.getPositions();
+    return positions.find((p) => p.instrument === target) ?? null;
+  }
+
+  async getOpenOrders(instrument?: string): Promise<Order[]> {
+    const symbol = instrument ? toExchangeSymbol(instrument, this.exchange) : undefined;
+    const data = await this.privateRequest('GET', '/api/v1/futures/trade/get_pending_orders', {
+      ...(symbol ? { symbol } : {}),
+      limit: 100,
+    });
+    const rows: any[] = Array.isArray(data?.orderList) ? data.orderList : [];
+    return rows.map((row): Order => this.normalizeOrder(row));
+  }
+
+  async createOrder(request: CreateOrderRequest, allowMarket: boolean = false): Promise<Order> {
+    if (request.type !== 'limit' && !allowMarket) {
+      throw new Error('SAFEGUARD: Solo se permiten ordenes LIMIT (usar allowMarket=true para casos especiales)');
+    }
+    const orderType = request.type === 'market' ? 'MARKET' : 'LIMIT';
+    const effect = request.post_only
+      ? 'POST_ONLY'
+      : (request.time_in_force ?? 'gtc').toUpperCase();
+    const isClose = request.metadata?.startsWith('close_') ?? false;
+    const symbol = toExchangeSymbol(request.instrument, this.exchange);
+    const side = isClose
+      ? (request.side === 'sell' ? 'BUY' : 'SELL')
+      : request.side.toUpperCase();
+    const body: Record<string, unknown> = {
+      symbol,
+      qty: request.size,
+      side,
+      tradeSide: isClose ? 'CLOSE' : 'OPEN',
+      orderType,
+      clientId: request.metadata || `grid_${Date.now()}`,
+    };
+    if (isClose) {
+      body.reduceOnly = true;
+      const positionSide = side === 'BUY' ? 'buy' : 'sell';
+      const position = (await this.getPositions().catch(() => []))
+        .find((pos) => pos.instrument === request.instrument && pos.side === positionSide);
+      if (position?.position_id) {
+        body.positionId = position.position_id;
+      }
+    }
+    if (orderType === 'LIMIT') {
+      body.price = request.price;
+      body.effect = effect;
+    }
+    const data = await this.privateRequest('POST', '/api/v1/futures/trade/place_order', {}, body);
+    const orderId = String(data?.orderId ?? data?.id ?? body.clientId);
+    return {
+      order_id: orderId,
+      sub_account_id: this.tradingAccountId,
+      instrument: request.instrument,
+      size: request.size,
+      filled_size: '0',
+      price: request.price || '0',
+      side: request.side,
+      type: request.type,
+      status: 'open',
+      time_in_force: request.time_in_force || 'gtc',
+      created_time: Date.now(),
+      updated_time: Date.now(),
+      metadata: String(data?.clientId ?? body.clientId),
+      legs: [{ limit_price: request.price || '0', is_buying_asset: request.side === 'buy' }],
+    } as Order;
+  }
+
+  async cancelOrder(orderId: string, instrument: string): Promise<boolean> {
+    try {
+      await this.privateRequest('POST', '/api/v1/futures/trade/cancel_orders', {}, {
+        symbol: toExchangeSymbol(instrument, this.exchange),
+        orderList: [{ orderId }],
+      });
+      return true;
+    } catch (error) {
+      console.error(`Error cancelando orden Bitunix ${orderId}:`, error);
+      return false;
+    }
+  }
+
+  async cancelAllOrders(instrument?: string): Promise<number> {
+    try {
+      const data = await this.privateRequest('POST', '/api/v1/futures/trade/cancel_all_orders', {}, {
+        ...(instrument ? { symbol: toExchangeSymbol(instrument, this.exchange) } : {}),
+      });
+      return Array.isArray(data?.successList) ? data.successList.length : 0;
+    } catch (error) {
+      console.error('Error cancelando ordenes Bitunix:', error);
+      return 0;
+    }
+  }
+
+  async setLeverage(instrument: string, leverage: number): Promise<boolean> {
+    try {
+      await this.privateRequest('POST', '/api/v1/futures/account/change_leverage', {}, {
+        symbol: toExchangeSymbol(instrument, this.exchange),
+        leverage,
+        marginCoin: 'USDT',
+      });
+      return true;
+    } catch (error) {
+      console.error('Error estableciendo leverage Bitunix:', error);
+      return false;
+    }
+  }
+
+  async getFillHistory(
+    limit: number = 100,
+    instrument?: string,
+    endTimeNs?: string
+  ): Promise<Fill[]> {
+    const symbol = instrument ? toExchangeSymbol(instrument, this.exchange) : undefined;
+    const endTime = endTimeNs ? Math.floor(Number(endTimeNs) / 1_000_000) : undefined;
+    const data = await this.privateRequest('GET', '/api/v1/futures/trade/get_history_trades', {
+      ...(symbol ? { symbol } : {}),
+      ...(endTime ? { endTime } : {}),
+      limit: Math.min(limit, 100),
+    });
+    const rows: any[] = Array.isArray(data?.tradeList) ? data.tradeList : [];
+    return rows.map((row): Fill => {
+      const side = String(row.side ?? '').toUpperCase() === 'SELL' ? 'sell' : 'buy';
+      const created = Number(row.ctime ?? Date.now());
+      const tradeId = String(row.tradeId ?? `${row.orderId ?? 'trade'}_${created}`);
+      return {
+        fill_id: tradeId,
+        order_id: String(row.orderId ?? ''),
+        sub_account_id: this.tradingAccountId,
+        instrument: fromExchangeSymbol(row.symbol, this.exchange),
+        size: String(row.qty ?? '0'),
+        price: String(row.price ?? '0'),
+        side,
+        fee: String(row.fee ?? '0'),
+        fee_currency: 'USDT',
+        liquidity: String(row.roleType ?? '').toUpperCase() === 'MAKER' ? 'maker' : 'taker',
+        created_time: created,
+        trade_id: tradeId,
+        event_time: String(created * 1_000_000),
+        is_buyer: side === 'buy',
+        is_taker: String(row.roleType ?? '').toUpperCase() !== 'MAKER',
+        client_order_id: row.clientId ? String(row.clientId) : undefined,
+        realized_pnl: row.realizedPNL != null ? String(row.realizedPNL) : undefined,
+      };
+    });
+  }
+
+  async getFundingHistory(limit: number = 100, instrument?: string): Promise<FundingPayment[]> {
+    if (!instrument) return [];
+    const symbol = toExchangeSymbol(instrument, this.exchange);
+    const data = await this.publicRequest('/api/v1/futures/market/get_funding_rate_history', {
+      symbol,
+      limit: Math.min(limit, 200),
+    });
+    const rows = Array.isArray(data) ? data : [];
+    const position = await this.getPosition(instrument).catch(() => null);
+    return rows.map((row): FundingPayment => ({
+      sub_account_id: this.tradingAccountId,
+      instrument: fromExchangeSymbol(symbol, this.exchange),
+      funding_rate: String(row.fundingRate ?? '0'),
+      payment: '0',
+      position_size: position?.size ?? '0',
+      funding_time: Math.floor(Number(row.fundingTime ?? Date.now()) / 1000),
+    }));
+  }
+
+  async calculateLiquidationPrice(instrument: string, _leverage: number): Promise<string> {
+    const pos = await this.getPosition(instrument);
+    return pos?.liquidation_price ?? '0';
+  }
+
+  private normalizeOrder(row: any): Order {
+    const side = String(row.side ?? '').toUpperCase() === 'SELL' ? 'sell' : 'buy';
+    const type = String(row.orderType ?? row.type ?? '').toUpperCase() === 'MARKET' ? 'market' : 'limit';
+    const price = String(row.price ?? '0');
+    return {
+      order_id: String(row.orderId ?? row.id ?? row.clientId ?? ''),
+      sub_account_id: this.tradingAccountId,
+      instrument: fromExchangeSymbol(row.symbol, this.exchange),
+      size: String(row.qty ?? '0'),
+      filled_size: String(row.tradeQty ?? '0'),
+      price,
+      side,
+      type,
+      status: normalizeBitunixOrderStatus(row.status),
+      time_in_force: normalizeBitunixTimeInForce(row.effect),
+      created_time: Number(row.ctime ?? Date.now()),
+      updated_time: Number(row.mtime ?? row.ctime ?? Date.now()),
+      metadata: row.clientId ? String(row.clientId) : undefined,
+      legs: [{ limit_price: price, is_buying_asset: side === 'buy' }],
+    } as Order;
+  }
+}
+
+export function createExchangeClient(
+  exchange: ExchangeId = getDefaultExchangeId(),
+  creds?: ExchangeClientCreds
+): TradingClient {
+  if (exchange === 'bitunix') {
+    return new BitunixClient(creds);
+  }
+  return new GRVTClient(requireGrvtCreds(creds));
+}
+
+// Instancia singleton del client. The legacy name stays for compatibility.
+export const grvtClient: TradingClient = createExchangeClient();
 
 export default grvtClient;

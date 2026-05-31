@@ -43,6 +43,8 @@ interface GrvtClient {
 // Same shape as the one in v2-router.ts EngineOps.
 interface EngineOps {
   createBot(config: {
+    userId: number;
+    exchange?: 'grvt' | 'bitunix';
     pair: string;
     direction: 'long' | 'short';
     leverage: number;
@@ -52,12 +54,14 @@ interface EngineOps {
     investmentUSDT: number;
     virtualEnabled?: boolean;
     activeWindowSize?: number;
+    grvtSubAccountId?: number | null;
   }): Promise<number>;
   startBot(botId: number): Promise<void>;
   pauseBot(botId: number): Promise<void>;
   closeBot(botId: number): Promise<void>;
   updateBotRange(botId: number, lowerPrice: number, upperPrice: number): Promise<void>;
   previewBotRangeUpdate(botId: number, lowerPrice: number, upperPrice: number): Promise<unknown>;
+  rebindGrvtClient?(userId: number, subAccountId?: number | null, exchange?: 'grvt' | 'bitunix' | string | null): Promise<void>;
 }
 
 export interface MountV2Options {
