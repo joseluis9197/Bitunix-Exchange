@@ -3449,7 +3449,7 @@ export class GridBotInstance {
       }
 
       // Recalculate grid profit every 12th tick (~60s).
-      // Flow: calculateRealGridProfit() runs FIFO on fills_archive,
+      // Flow: calculateRealGridProfit() pairs grid fills from fills_archive,
       // persists new pairs to paired_roundtrips, then we read the
       // canonical profit from paired_roundtrips (single source of truth).
       this.pnlUpdateCounter++;
@@ -3510,9 +3510,11 @@ export class GridBotInstance {
   }
 
   /**
-   * Realized grid profit for this bot, computed by FIFO matching only
-   * fills that happened after the bot was created. This keeps old account
-   * history on the same symbol from leaking into a new bot's stats.
+   * Realized grid profit for this bot, computed by LIFO matching only
+   * fills that happened after the bot was created. A grid sell should close
+   * the nearest/recent lower buy, not the oldest inventory lot from a prior
+   * market move; FIFO is exchange-style realized PnL, but it mislabels grid
+   * scalps as losses during a trending move.
    */
   private async calculateRealGridProfit(): Promise<number | null> {
     try {
@@ -3555,7 +3557,8 @@ export class GridBotInstance {
 
         let remaining = f.size;
         while (remaining > EPS && openLots.length > 0) {
-          const lot = openLots[0]!;
+          const lotIndex = openLots.length - 1;
+          const lot = openLots[lotIndex]!;
           const matched = Math.min(lot.size, remaining);
           const buyFill = this.bot.direction === 'long' ? lot : f;
           const sellFill = this.bot.direction === 'long' ? f : lot;
@@ -3576,7 +3579,7 @@ export class GridBotInstance {
 
           lot.size -= matched;
           remaining -= matched;
-          if (lot.size <= EPS) openLots.shift();
+          if (lot.size <= EPS) openLots.splice(lotIndex, 1);
         }
       }
 

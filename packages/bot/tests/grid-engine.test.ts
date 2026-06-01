@@ -112,6 +112,25 @@ describe('GridBotInstance', () => {
       const result = await (instance as any).calculateRealGridProfit();
       expect(result === null || result === 0).toBe(true);
     });
+
+    it('matches grid sells against the newest open buy lot', async () => {
+      mockDb.getFillsForBot.mockResolvedValue([
+        { fill_id: 'old_buy', is_buyer: 1, price: 100, size: 1, fee: 0, event_time: '1000' },
+        { fill_id: 'new_buy', is_buyer: 1, price: 90, size: 1, fee: 0, event_time: '2000' },
+        { fill_id: 'sell', is_buyer: 0, price: 95, size: 1, fee: 0, event_time: '3000' },
+      ]);
+
+      const result = await (instance as any).calculateRealGridProfit();
+
+      expect(result).toBe(5);
+      expect(mockDb.insertPairedRoundtrip).toHaveBeenCalledWith(expect.objectContaining({
+        buy_fill_id: 'new_buy',
+        sell_fill_id: 'sell',
+        buy_price: 90,
+        sell_price: 95,
+        profit: 5,
+      }));
+    });
   });
 
   describe('handleOrderFilled', () => {
