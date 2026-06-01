@@ -2789,6 +2789,15 @@ export class GridBotInstance {
     
     // 1. Get open orders from GRVT
     const openOrders = await this.grvt.getOpenOrders(this.bot.pair);
+    const liveOrderIds = openOrders
+      .map((order: any) => String(order?.order_id || ''))
+      .filter(Boolean);
+    const reconciledOrders = await db.reconcileStalePendingOrders(this.bot.id, liveOrderIds);
+    if (reconciledOrders.filled > 0 || reconciledOrders.cancelled > 0) {
+      log.info(
+        `🧾 Reconciled stale DB orders: ${reconciledOrders.filled} filled, ${reconciledOrders.cancelled} cancelled`
+      );
+    }
     
     // 2. Get current price from the last ticker
     const ticker = await this.grvt.getTicker(this.bot.pair);

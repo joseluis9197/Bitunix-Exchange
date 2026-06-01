@@ -1318,6 +1318,68 @@ export class GridBotDB {
     `, [status, orderId]);
   }
 
+  async reconcileStalePendingOrders(
+    botId: number,
+    liveOrderIds: string[],
+    options: { olderThanMs?: number; priceTolerance?: number } = {}
+  ): Promise<{ checked: number; skippedLive: number; filled: number; cancelled: number }> {
+    const olderThanSeconds = Math.max(0, Math.ceil((options.olderThanMs ?? 120_000) / 1000));
+    const priceTolerance = options.priceTolerance ?? 0.01;
+    const live = new Set(liveOrderIds.map((id) => String(id || '')).filter(Boolean));
+    const candidates = await this.dbAll(`
+      SELECT id, order_id, side, price, created_at
+      FROM orders
+      WHERE bot_id = ?
+        AND status = 'pending'
+        AND datetime(created_at) <= datetime('now', ?)
+    `, [botId, `-${olderThanSeconds} seconds`]) as Array<{
+      id: number;
+      order_id: string;
+      side: 'buy' | 'sell';
+      price: number;
+      created_at: string;
+    }>;
+
+    let skippedLive = 0;
+    let filled = 0;
+    let cancelled = 0;
+
+    for (const order of candidates) {
+      if (live.has(order.order_id)) {
+        skippedLive++;
+        continue;
+      }
+
+      const matchingFill = await this.dbGet(`
+        SELECT id
+        FROM fills_archive
+        WHERE bot_id = ?
+          AND is_buyer = ?
+          AND ABS(price - ?) <= ?
+          AND datetime(created_at) >= datetime(?, '-10 minutes')
+        ORDER BY datetime(created_at) DESC, id DESC
+        LIMIT 1
+      `, [botId, order.side === 'buy' ? 1 : 0, order.price, priceTolerance, order.created_at]) as { id: number } | undefined;
+
+      const nextStatus = matchingFill ? 'filled' : 'cancelled';
+      await this.dbRun(`
+        UPDATE orders
+        SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'pending'
+      `, [nextStatus, order.id]);
+
+      if (matchingFill) filled++;
+      else cancelled++;
+    }
+
+    return {
+      checked: candidates.length,
+      skippedLive,
+      filled,
+      cancelled,
+    };
+  }
+
   // === CRUD para trades ===
 
   /**

@@ -40,6 +40,7 @@ const { mockGrvtClient, mockDb } = vi.hoisted(() => ({
     insertFillArchive: vi.fn(),
     getFillsForBot: vi.fn(),
     clearPairedRoundtripsForBot: vi.fn(),
+    reconcileStalePendingOrders: vi.fn(),
     insertPairedRoundtrip: vi.fn(),
     getFillsArchive: vi.fn(),
     getPairedRoundtrips: vi.fn(),
@@ -96,6 +97,7 @@ describe('GridBotInstance', () => {
     mockDb.getGridLevels.mockResolvedValue([]);
     mockDb.getOrders.mockResolvedValue([]);
     mockDb.getFillsForBot.mockResolvedValue([]);
+    mockDb.reconcileStalePendingOrders.mockResolvedValue({ checked: 0, skippedLive: 0, filled: 0, cancelled: 0 });
     mockDb.getFillsArchive.mockResolvedValue([]);
     mockDb.getPairedRoundtrips.mockResolvedValue([]);
 
